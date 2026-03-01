@@ -1,0 +1,204 @@
+"""Tests for sqfox search: normalization, fusion, RRF, adaptive alpha."""
+
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+import pytest
+
+from sqfox.search import (
+    _min_max_normalize,
+    score_fusion,
+    rrf_fallback,
+    adaptive_alpha,
+    _std,
+)
+
+
+# ---------------------------------------------------------------------------
+# Score normalization
+# ---------------------------------------------------------------------------
+
+class TestMinMaxNormalize:
+    def test_basic_normalization(self):
+        results = [(1, 10.0), (2, 20.0), (3, 30.0)]
+        norm = _min_max_normalize(results)
+        assert norm[1] == pytest.approx(0.0)
+        assert norm[2] == pytest.approx(0.5)
+        assert norm[3] == pytest.approx(1.0)
+
+    def test_identical_scores(self):
+        results = [(1, 5.0), (2, 5.0), (3, 5.0)]
+        norm = _min_max_normalize(results)
+        assert all(v == 1.0 for v in norm.values())
+
+    def test_empty(self):
+        assert _min_max_normalize([]) == {}
+
+    def test_single_result(self):
+        results = [(1, 42.0)]
+        norm = _min_max_normalize(results)
+        assert norm[1] == 1.0
+
+    def test_two_results(self):
+        results = [(1, 0.0), (2, 1.0)]
+        norm = _min_max_normalize(results)
+        assert norm[1] == pytest.approx(0.0)
+        assert norm[2] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Score fusion
+# ---------------------------------------------------------------------------
+
+class TestScoreFusion:
+    def test_balanced(self):
+        fts = [(1, 10.0), (2, 5.0)]
+        vec = [(1, 0.8), (2, 0.6)]
+        result = score_fusion(fts, vec, alpha=0.5)
+        # Doc 1 should rank first (highest in both)
+        assert result[0][0] == 1
+
+    def test_fts_only_alpha_zero(self):
+        fts = [(1, 10.0), (2, 5.0)]
+        vec = [(2, 0.9), (1, 0.1)]
+        result = score_fusion(fts, vec, alpha=0.0)
+        # With alpha=0, only FTS matters
+        assert result[0][0] == 1
+
+    def test_vec_only_alpha_one(self):
+        fts = [(1, 10.0), (2, 5.0)]
+        vec = [(2, 0.9), (1, 0.1)]
+        result = score_fusion(fts, vec, alpha=1.0)
+        # With alpha=1, only vec matters
+        assert result[0][0] == 2
+
+    def test_no_overlap(self):
+        fts = [(1, 10.0)]
+        vec = [(2, 0.8)]
+        result = score_fusion(fts, vec, alpha=0.5)
+        # Both docs should appear
+        doc_ids = [r[0] for r in result]
+        assert 1 in doc_ids
+        assert 2 in doc_ids
+
+    def test_one_empty(self):
+        fts = [(1, 10.0), (2, 5.0)]
+        vec = []
+        result = score_fusion(fts, vec, alpha=0.5)
+        # Only FTS results, but weighted by (1-alpha)
+        assert len(result) == 2
+        assert result[0][0] == 1
+
+    def test_scores_in_zero_one_range(self):
+        fts = [(1, 100.0), (2, 50.0), (3, 10.0)]
+        vec = [(1, 0.95), (3, 0.80), (4, 0.70)]
+        result = score_fusion(fts, vec, alpha=0.5)
+        for _, score in result:
+            assert 0.0 <= score <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# RRF fallback
+# ---------------------------------------------------------------------------
+
+class TestRRF:
+    def test_basic(self):
+        fts = [(1, 10.0), (2, 5.0)]
+        vec = [(1, 0.8), (3, 0.5)]
+        result = rrf_fallback(fts, vec, k=60)
+        # Doc 1 appears in both -> highest RRF score
+        assert result[0][0] == 1
+
+    def test_overlapping_boosts_rank(self):
+        fts = [(1, 10.0), (2, 5.0)]
+        vec = [(2, 0.9), (3, 0.5)]
+        result = rrf_fallback(fts, vec, k=60)
+        # Doc 2 in both lists -> should rank high
+        doc_ids = [r[0] for r in result]
+        # Doc 2 has RRF from rank 1 in FTS + rank 0 in vec
+        # Doc 1 has RRF only from rank 0 in FTS
+        # Since 1/(60+1) + 1/(60+2) > 1/(60+1), doc 2 should not beat doc 1
+        # Actually doc 1: 1/61 = 0.01639
+        # Doc 2: 1/62 + 1/61 = 0.01613 + 0.01639 = 0.03252
+        # So doc 2 wins!
+        assert result[0][0] == 2
+
+    def test_different_k(self):
+        fts = [(1, 10.0), (2, 5.0)]
+        vec = [(1, 0.8)]
+        result_k2 = rrf_fallback(fts, vec, k=2)
+        result_k100 = rrf_fallback(fts, vec, k=100)
+        # With low k, rank differences matter more
+        # Doc 1 should be top in both, but scores differ
+        assert result_k2[0][0] == 1
+        assert result_k100[0][0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Adaptive alpha
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveAlpha:
+    def test_code_query_decreases_alpha(self):
+        query = "camelCase function_name()"
+        fts = [(i, 10.0 - i) for i in range(5)]
+        vec = [(i, 0.9 - i * 0.1) for i in range(5)]
+        alpha = adaptive_alpha(query, fts, vec, base_alpha=0.5)
+        assert alpha < 0.5
+
+    def test_question_query_increases_alpha(self):
+        query = "how to configure database"
+        # Use identical score distributions so std ratio doesn't adjust
+        fts = [(i, 10.0 - i * 2.0) for i in range(5)]
+        vec = [(i, 10.0 - i * 2.0) for i in range(5)]
+        alpha = adaptive_alpha(query, fts, vec, base_alpha=0.5)
+        assert alpha > 0.5
+
+    def test_empty_fts_favors_vectors(self):
+        query = "test query"
+        fts = [(1, 5.0)]  # Only 1 result
+        vec = [(i, 0.9 - i * 0.1) for i in range(5)]
+        alpha = adaptive_alpha(query, fts, vec, base_alpha=0.5)
+        assert alpha >= 0.8
+
+    def test_empty_vec_favors_fts(self):
+        query = "test query"
+        fts = [(i, 10.0 - i) for i in range(5)]
+        vec = [(1, 0.5)]  # Only 1 result
+        alpha = adaptive_alpha(query, fts, vec, base_alpha=0.5)
+        assert alpha <= 0.2
+
+    def test_clamped_to_range(self):
+        query = "how to camelCase function_name() test.run()"
+        fts = [(1, 5.0)]
+        vec = [(i, 0.9 - i * 0.1) for i in range(5)]
+        alpha = adaptive_alpha(query, fts, vec, base_alpha=0.0)
+        assert 0.0 <= alpha <= 1.0
+
+    def test_normal_query_stays_near_base(self):
+        query = "sqlite database configuration"
+        fts = [(i, 10.0 - i) for i in range(5)]
+        vec = [(i, 0.9 - i * 0.1) for i in range(5)]
+        alpha = adaptive_alpha(query, fts, vec, base_alpha=0.5)
+        assert 0.3 <= alpha <= 0.7
+
+
+# ---------------------------------------------------------------------------
+# Standard deviation helper
+# ---------------------------------------------------------------------------
+
+class TestStd:
+    def test_basic(self):
+        values = [2.0, 4.0, 6.0, 8.0]
+        # Mean = 5, variance = (9+1+1+9)/4 = 5, std = sqrt(5) ≈ 2.236
+        assert _std(values) == pytest.approx(2.236, abs=0.01)
+
+    def test_identical_values(self):
+        assert _std([5.0, 5.0, 5.0]) == 0.0
+
+    def test_single_value(self):
+        assert _std([5.0]) == 0.0
+
+    def test_empty(self):
+        assert _std([]) == 0.0

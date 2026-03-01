@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqfox"
+version = "0.1.0"
+description = "Lightweight, thread-safe SQLite wrapper with hybrid search (FTS5 + vectors)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "SiberXXX" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Text Processing :: Indexing",
+]
+keywords = ["sqlite", "search", "fts5", "vector", "rag", "edge", "iot"]
+dependencies = []
+
+[project.optional-dependencies]
+search = [
+    "simplemma>=0.9",
+    "sqlite-vec>=0.1.1",
+]
+search-ru = [
+    "simplemma>=0.9",
+    "sqlite-vec>=0.1.1",
+    "pymorphy3>=2.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-timeout>=2.0",
+]
+
+[project.urls]
+Repository = "https://github.com/SiberXXX/sqfox"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqfox"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 30

@@ -690,6 +690,9 @@ class SQFox:
         If embed_fn is provided, computes embeddings and stores in vec0.
         Also lemmatizes content for FTS if a tokenizer is available.
 
+        Heavy computation (chunking, lemmatization, embedding) runs in the
+        calling thread.  Only pure SQL writes are sent to the writer thread.
+
         Returns the parent document ID.
         """
         import json as _json
@@ -702,6 +705,45 @@ class SQFox:
         from .tokenizer import lemmatize
 
         meta_str = _json.dumps(metadata) if metadata else "{}"
+
+        # ----------------------------------------------------------
+        # Phase 1: heavy computation in the CALLING thread
+        # ----------------------------------------------------------
+
+        # Chunking
+        if chunker is not None:
+            chunks = chunker(content)
+            if not chunks:
+                chunks = [content]
+        else:
+            chunks = [content]
+
+        # Lemmatization
+        lemmatized_chunks: list[str | None] = []
+        for chunk_text in chunks:
+            try:
+                lemmatized_chunks.append(lemmatize(chunk_text))
+            except Exception as exc:
+                logger.warning("Lemmatization failed: %s", exc)
+                lemmatized_chunks.append(None)
+
+        # Embedding
+        embeddings: list[list[float]] | None = None
+        vec_blobs: list[bytes] | None = None
+        if embed_fn is not None:
+            embeddings = embed_for_documents(embed_fn, chunks)
+            if embeddings:
+                vec_blobs = [
+                    _struct.pack(f"{len(emb)}f", *emb)
+                    for emb in embeddings
+                ]
+
+        # ----------------------------------------------------------
+        # Phase 2: pure SQL on the writer thread
+        # ----------------------------------------------------------
+
+        has_chunker = chunker is not None
+        vec_dim = len(embeddings[0]) if embeddings else None
 
         def _do_ingest(conn: sqlite3.Connection) -> int:
             # Ensure at least BASE schema
@@ -717,19 +759,10 @@ class SQFox:
             parent_id = cursor.lastrowid
             assert parent_id is not None
 
-            # Determine chunks
-            if chunker is not None:
-                chunks = chunker(content)
-                if not chunks:
-                    chunks = [content]  # Fallback: empty chunker result
-            else:
-                chunks = [content]
-
-            # Process chunks
+            # Insert chunks
             chunk_ids: list[int] = []
-            for chunk_text in chunks:
-                if chunker is not None:
-                    # Insert chunk as child document
+            for i, chunk_text in enumerate(chunks):
+                if has_chunker:
                     cur = conn.execute(
                         "INSERT INTO documents (content, metadata, chunk_of) "
                         "VALUES (?, ?, ?)",
@@ -741,44 +774,34 @@ class SQFox:
                 else:
                     chunk_ids.append(parent_id)
 
-            # Lemmatize
-            for cid, chunk_text in zip(chunk_ids, chunks):
-                try:
-                    lemmatized = lemmatize(chunk_text)
+            # Write lemmatized content
+            for cid, lem in zip(chunk_ids, lemmatized_chunks):
+                if lem is not None:
                     conn.execute(
                         "UPDATE documents SET content_lemmatized = ? WHERE id = ?",
-                        (lemmatized, cid),
+                        (lem, cid),
                     )
-                except Exception as exc:
-                    logger.warning("Lemmatization failed for doc %d: %s", cid, exc)
 
-            # Embed if embed_fn provided
-            if embed_fn is not None:
-                embeddings = embed_for_documents(embed_fn, chunks)
+            # Write embeddings
+            if vec_blobs is not None and vec_dim is not None:
+                validate_dimension(conn, vec_dim, commit=False)
 
-                # Validate dimension
-                if embeddings:
-                    dim = len(embeddings[0])
-                    validate_dimension(conn, dim, commit=False)
+                current = detect_state(conn)
+                if current < SchemaState.INDEXED:
+                    migrate_to(conn, SchemaState.INDEXED, vec_dimension=vec_dim)
 
-                    # Ensure INDEXED schema
-                    current = detect_state(conn)
-                    if current < SchemaState.INDEXED:
-                        migrate_to(conn, SchemaState.INDEXED, vec_dimension=dim)
+                for cid, blob in zip(chunk_ids, vec_blobs):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO documents_vec(rowid, embedding) "
+                        "VALUES (?, ?)",
+                        (cid, blob),
+                    )
+                    conn.execute(
+                        "UPDATE documents SET vec_indexed = 1 WHERE id = ?",
+                        (cid,),
+                    )
 
-                    for cid, emb in zip(chunk_ids, embeddings):
-                        vec_blob = _struct.pack(f"{len(emb)}f", *emb)
-                        conn.execute(
-                            "INSERT OR REPLACE INTO documents_vec(rowid, embedding) "
-                            "VALUES (?, ?)",
-                            (cid, vec_blob),
-                        )
-                        conn.execute(
-                            "UPDATE documents SET vec_indexed = 1 WHERE id = ?",
-                            (cid,),
-                        )
-
-            # Ensure FTS if SEARCHABLE or ENRICHED
+            # FTS sync for SEARCHABLE (no triggers) state
             current = detect_state(conn)
             if current >= SchemaState.SEARCHABLE:
                 for cid in chunk_ids:
@@ -787,7 +810,6 @@ class SQFox:
                         (cid,),
                     ).fetchone()
                     if row and row[0] and current < SchemaState.ENRICHED:
-                        # Manual FTS insert (no triggers)
                         conn.execute(
                             "INSERT INTO documents_fts(rowid, content_lemmatized) "
                             "VALUES (?, ?)",

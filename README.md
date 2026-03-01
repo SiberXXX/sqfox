@@ -1,7 +1,7 @@
 # sqfox
 
 <p align="center">
-  <img src="sqfox.jpg" alt="sqfox mascot" width="300">
+  <img src="https://raw.githubusercontent.com/SiberXXX/sqfox/main/sqfox.jpg" alt="sqfox mascot" width="300">
 </p>
 
 Lightweight, thread-safe SQLite wrapper with hybrid search (FTS5 + vectors).
@@ -344,7 +344,7 @@ MIT
 # sqfox (RU)
 
 <p align="center">
-  <img src="sqfox.jpg" alt="sqfox — скуфокс" width="300">
+  <img src="https://raw.githubusercontent.com/SiberXXX/sqfox/main/sqfox.jpg" alt="sqfox — скуфокс" width="300">
 </p>
 
 Легковесная, потокобезопасная обёртка над SQLite с гибридным поиском (FTS5 + векторы).

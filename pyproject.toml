@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqfox"
-version = "0.1.1"
+version = "0.1.2"
 description = "Lightweight, thread-safe SQLite wrapper with hybrid search (FTS5 + vectors)"
 readme = "README.md"
 license = "MIT"

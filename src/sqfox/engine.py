@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import queue
 import sqlite3
+import sys
 import threading
 import time
 from concurrent.futures import Future
@@ -28,6 +29,16 @@ from .types import (
 )
 
 logger = logging.getLogger("sqfox.engine")
+
+
+def _get_version() -> str:
+    """Get package version without circular import."""
+    try:
+        from importlib.metadata import version
+        return version("sqfox")
+    except Exception:
+        return "unknown"
+
 
 # Sentinel type for poison pill
 _STOP = object()
@@ -63,6 +74,11 @@ class SQFox:
         error_callback: Callable[[str, Exception], None] | None = None,
     ) -> None:
         self._path = str(path)
+        # Shared-cache URI for :memory: databases so readers see writer's data
+        if self._path == ":memory:" or self._path.startswith("file::memory:"):
+            self._shared_mem_uri = f"file:sqfox_{id(self)}?mode=memory&cache=shared"
+        else:
+            self._shared_mem_uri = None
         self._max_queue_size = max_queue_size
         self._batch_size = batch_size
         self._batch_time_ms = batch_time_ms
@@ -87,8 +103,16 @@ class SQFox:
 
         # Lifecycle
         self._running = threading.Event()
-        self._stopped = False
+        self._stop_event = threading.Event()
         self._vec_available = False
+
+        # Lock to prevent race between write() and stop()
+        self._write_lock = threading.Lock()
+
+        # Schema state cache — only mutated from writer thread,
+        # so no lock needed.  Avoids redundant detect_state() queries
+        # to sqlite_master on every ingest.
+        self._schema_state_cache: SchemaState | None = None
 
         # Hooks
         self._on_startup_hooks: list[Callable[[SQFox], None]] = []
@@ -112,7 +136,11 @@ class SQFox:
 
     def _configure_connection(self, conn: sqlite3.Connection) -> None:
         """Apply PRAGMA tuning to a connection."""
-        is_file = self._path != ":memory:" and not self._path.startswith("file::memory:")
+        is_file = (
+            self._path != ":memory:"
+            and not self._path.startswith("file::memory:")
+            and self._shared_mem_uri is None
+        )
 
         if is_file:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -158,7 +186,10 @@ class SQFox:
 
     def _create_writer_connection(self) -> sqlite3.Connection:
         """Create and configure the writer connection."""
-        conn = sqlite3.connect(self._path, check_same_thread=False)
+        if self._shared_mem_uri:
+            conn = sqlite3.connect(self._shared_mem_uri, uri=True, check_same_thread=False)
+        else:
+            conn = sqlite3.connect(self._path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         self._configure_connection(conn)
         self._vec_available = self._try_load_vec(conn)
@@ -166,19 +197,21 @@ class SQFox:
 
     def _get_reader_connection(self) -> sqlite3.Connection:
         """Get or create a reader connection for the current thread."""
-        if self._stopped:
+        if self._stop_event.is_set():
             raise EngineClosedError("Engine is stopped, cannot create reader connection")
 
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             return conn
 
-        if self._stopped:
-            raise EngineClosedError("Engine is stopped, cannot create reader connection")
-
-        conn = sqlite3.connect(self._path, check_same_thread=False)
+        if self._shared_mem_uri:
+            conn = sqlite3.connect(self._shared_mem_uri, uri=True, check_same_thread=False)
+        else:
+            conn = sqlite3.connect(self._path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         self._configure_connection(conn)
+        if self._shared_mem_uri:
+            conn.execute("PRAGMA read_uncommitted=ON")
         conn.execute("PRAGMA query_only=ON")
 
         if self._vec_available:
@@ -186,9 +219,15 @@ class SQFox:
 
         tid = threading.get_ident()
         with self._reader_lock:
+            # Check under lock: if stop() ran while we were creating
+            # the connection, close it and reject.
+            if self._stop_event.is_set():
+                conn.close()
+                raise EngineClosedError("Engine stopped during reader creation")
+
             self._reader_connections[tid] = conn
-            # Periodically prune connections from dead threads (every 50 connections)
-            if len(self._reader_connections) % 50 == 0:
+            # Prune connections from dead threads when count exceeds threshold
+            if len(self._reader_connections) > 50:
                 alive_ids = {t.ident for t in threading.enumerate()}
                 dead_ids = [k for k in self._reader_connections if k not in alive_ids]
                 for dead_id in dead_ids:
@@ -215,7 +254,7 @@ class SQFox:
         assert self._writer_conn is not None
 
         try:
-            while self._running.is_set() or not self._queue.empty():
+            while not self._stop_event.is_set() or not self._queue.empty():
                 batch: list[WriteRequest] = []
                 deadline = time.monotonic() + (self._batch_time_ms / 1000.0)
 
@@ -242,6 +281,7 @@ class SQFox:
 
         except Exception as exc:
             logger.error("Writer thread crashed: %s", exc, exc_info=True)
+            self._stop_event.set()
             # Drain remaining items and set exceptions on their futures
             while not self._queue.empty():
                 try:
@@ -262,21 +302,22 @@ class SQFox:
 
     def start(self) -> None:
         """Start the writer thread and run startup hooks."""
-        if self._stopped:
-            raise EngineClosedError("Engine has been stopped and cannot be restarted")
-        if self._running.is_set():
-            return  # Already running
+        with self._write_lock:
+            if self._stop_event.is_set():
+                raise EngineClosedError("Engine has been stopped and cannot be restarted")
+            if self._running.is_set():
+                return  # Already running
 
-        self._writer_conn = self._create_writer_connection()
-        self._running.set()
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop,
-            name="sqfox-writer",
-            daemon=False,
-        )
-        self._writer_thread.start()
+            self._writer_conn = self._create_writer_connection()
+            self._running.set()
+            self._writer_thread = threading.Thread(
+                target=self._writer_loop,
+                name="sqfox-writer",
+                daemon=False,
+            )
+            self._writer_thread.start()
 
-        # Run startup hooks
+        # Run startup hooks outside the lock
         for hook in self._on_startup_hooks:
             try:
                 hook(self)
@@ -287,19 +328,20 @@ class SQFox:
 
     def stop(self, timeout: float = 10.0) -> None:
         """Gracefully shut down: drain queue, close all connections."""
-        if not self._running.is_set() and self._writer_thread is None:
-            self._stopped = True
-            return
+        with self._write_lock:
+            if not self._running.is_set() and self._writer_thread is None:
+                self._stop_event.set()
+                return
 
-        # Signal writer to stop — set stopped first to reject new writes
-        self._stopped = True
-        self._running.clear()
+            # Signal writer to stop — set stopped first to reject new writes
+            self._stop_event.set()
 
-        # Send poison pill with highest priority
-        try:
-            self._queue.put_nowait((Priority.HIGH, 0, _STOP))
-        except queue.Full:
-            logger.warning("Queue full during shutdown, forcing stop")
+            # Poison pill at LOW priority + sys.maxsize seq so it drains
+            # after ALL pending requests (HIGH, NORMAL, LOW) in the queue
+            try:
+                self._queue.put_nowait((Priority.LOW, sys.maxsize, _STOP))
+            except queue.Full:
+                logger.warning("Queue full during shutdown, forcing stop")
 
         # Wait for writer thread
         if self._writer_thread is not None:
@@ -347,6 +389,9 @@ class SQFox:
                 except Exception:
                     pass
             self._reader_connections.clear()
+            self._local = threading.local()
+
+        self._schema_state_cache = None
 
     def __enter__(self) -> SQFox:
         self.start()
@@ -354,6 +399,18 @@ class SQFox:
 
     def __exit__(self, *exc_info: Any) -> None:
         self.stop()
+
+    def __del__(self) -> None:
+        if self._running.is_set():
+            logger.warning(
+                "SQFox engine at %r was garbage-collected while still running. "
+                "Call stop() explicitly or use the context manager.",
+                self._path,
+            )
+            try:
+                self.stop(timeout=2.0)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Public API — hooks
@@ -398,9 +455,6 @@ class SQFox:
             EngineClosedError: If engine is stopped.
             QueueFullError:    If queue is at max capacity.
         """
-        if self._stopped or not self._running.is_set():
-            raise EngineClosedError("Engine is not running")
-
         future: Future[Any] = Future()
         request = WriteRequest(
             sql=sql,
@@ -410,13 +464,17 @@ class SQFox:
             many=many,
         )
 
-        seq = self._next_seq()
-        try:
-            self._queue.put_nowait((priority, seq, request))
-        except queue.Full:
-            raise QueueFullError(
-                f"Write queue is full ({self._max_queue_size} items)"
-            ) from None
+        with self._write_lock:
+            if self._stop_event.is_set() or not self._running.is_set():
+                raise EngineClosedError("Engine is not running")
+
+            seq = self._next_seq()
+            try:
+                self._queue.put_nowait((priority, seq, request))
+            except queue.Full:
+                raise QueueFullError(
+                    f"Write queue is full ({self._max_queue_size} items)"
+                ) from None
 
         if wait:
             return future.result()
@@ -436,27 +494,26 @@ class SQFox:
 
         The callable receives the writer's sqlite3.Connection.
         """
-        if self._stopped or not self._running.is_set():
-            raise EngineClosedError("Engine is not running")
-
         future: Future[Any] = Future()
 
-        # We wrap the callable into a special WriteRequest with a sentinel SQL
-        # and handle it in _execute_batch by detecting the callable
         request = WriteRequest(
-            sql="__EXEC_FN__",
-            params=fn,  # type: ignore[arg-type]
+            sql="",
             priority=priority,
             future=future,
+            fn=fn,
         )
 
-        seq = self._next_seq()
-        try:
-            self._queue.put_nowait((priority, seq, request))
-        except queue.Full:
-            raise QueueFullError(
-                f"Write queue is full ({self._max_queue_size} items)"
-            ) from None
+        with self._write_lock:
+            if self._stop_event.is_set() or not self._running.is_set():
+                raise EngineClosedError("Engine is not running")
+
+            seq = self._next_seq()
+            try:
+                self._queue.put_nowait((priority, seq, request))
+            except queue.Full:
+                raise QueueFullError(
+                    f"Write queue is full ({self._max_queue_size} items)"
+                ) from None
 
         if wait:
             return future.result()
@@ -467,15 +524,18 @@ class SQFox:
         assert self._writer_conn is not None
 
         # Separate callable requests from SQL requests
-        fn_requests = [r for r in batch if r.sql == "__EXEC_FN__"]
-        sql_requests = [r for r in batch if r.sql != "__EXEC_FN__"]
+        fn_requests = [r for r in batch if r.fn is not None]
+        sql_requests = [r for r in batch if r.fn is None]
 
         # Execute callable requests (each in its own transaction)
         for req in fn_requests:
             try:
-                fn = req.params
-                assert callable(fn)
-                result = fn(self._writer_conn)
+                result = req.fn(self._writer_conn)
+                # Auto-commit if the callable left an open transaction.
+                # This prevents poisoning the connection for subsequent
+                # BEGIN IMMEDIATE in _execute_batch.
+                if self._writer_conn.in_transaction:
+                    self._writer_conn.commit()
                 if req.future is not None:
                     req.future.set_result(result)
             except Exception as exc:
@@ -484,7 +544,7 @@ class SQFox:
                     self._writer_conn.rollback()
                 except Exception:
                     pass
-                self._notify_error(req.sql, exc)
+                self._notify_error("<execute_on_writer>", exc)
                 if req.future is not None:
                     req.future.set_exception(exc)
 
@@ -617,7 +677,7 @@ class SQFox:
         """
         import platform
         info: dict[str, Any] = {
-            "sqfox_version": "0.1.0",
+            "sqfox_version": _get_version(),
             "python_version": platform.python_version(),
             "platform": platform.platform(),
             "machine": platform.machine(),
@@ -629,6 +689,7 @@ class SQFox:
             "max_queue_size": self._max_queue_size,
             "batch_size": self._batch_size,
             "batch_time_ms": self._batch_time_ms,
+            "schema_state": self._schema_state_cache.name if self._schema_state_cache is not None else None,
         }
 
         # Check optional deps
@@ -676,10 +737,30 @@ class SQFox:
         if not self._running.is_set():
             raise EngineClosedError("Engine is not running, cannot backup")
 
+        is_memory = self._shared_mem_uri is not None
+
+        if not is_memory:
+            # Guard against backing up to the same file
+            src_path = Path(self._path).resolve()
+            dst_path = Path(target).resolve()
+            if src_path == dst_path:
+                raise ValueError(
+                    f"Backup target is the same as the source database: {dst_path}"
+                )
+
         dst = sqlite3.connect(str(target))
         try:
-            conn = self._get_reader_connection()
-            conn.backup(dst, pages=pages, progress=progress)
+            if is_memory:
+                # For in-memory DBs, the reader creates a separate empty DB.
+                # We must use the writer connection which holds the actual data.
+                self.execute_on_writer(
+                    lambda conn: conn.backup(dst, pages=pages, progress=progress),
+                    priority=Priority.HIGH,
+                    wait=True,
+                )
+            else:
+                conn = self._get_reader_connection()
+                conn.backup(dst, pages=pages, progress=progress)
         finally:
             dst.close()
 
@@ -696,11 +777,15 @@ class SQFox:
         """Ensure schema is at least at the target state.
 
         Runs on the writer connection.  Blocks until complete.
+        Invalidates and refreshes the schema state cache.
         """
-        from .schema import migrate_to
+        from .schema import migrate_to, detect_state
 
         def _do_migrate(conn: sqlite3.Connection) -> SchemaState:
-            return migrate_to(conn, target, vec_dimension=vec_dimension)
+            result = migrate_to(conn, target, vec_dimension=vec_dimension)
+            # Refresh cache after explicit migration
+            self._schema_state_cache = detect_state(conn)
+            return result
 
         return self.execute_on_writer(_do_migrate, priority=Priority.HIGH, wait=True)
 
@@ -736,7 +821,13 @@ class SQFox:
         )
         from .tokenizer import lemmatize
 
-        meta_str = _json.dumps(metadata) if metadata else "{}"
+        if metadata:
+            try:
+                meta_str = _json.dumps(metadata)
+            except TypeError as exc:
+                raise SQFoxError(f"metadata is not JSON-serializable: {exc}") from exc
+        else:
+            meta_str = "{}"
 
         # ----------------------------------------------------------
         # Phase 1: heavy computation in the CALLING thread
@@ -745,6 +836,7 @@ class SQFox:
         # Chunking
         if chunker is not None:
             chunks = chunker(content)
+            chunks = [c for c in chunks if c.strip()]
             if not chunks:
                 chunks = [content]
         else:
@@ -765,6 +857,12 @@ class SQFox:
         if embed_fn is not None:
             embeddings = embed_for_documents(embed_fn, chunks)
             if embeddings:
+                if len(embeddings) != len(chunks):
+                    raise SQFoxError(
+                        f"embed_fn returned {len(embeddings)} embeddings for "
+                        f"{len(chunks)} chunks — must return exactly one "
+                        f"embedding per chunk"
+                    )
                 vec_blobs = [
                     _struct.pack(f"{len(emb)}f", *emb)
                     for emb in embeddings
@@ -777,82 +875,108 @@ class SQFox:
         has_chunker = chunker is not None
         vec_dim = len(embeddings[0]) if embeddings else None
 
-        def _do_ingest(conn: sqlite3.Connection) -> int:
-            # Ensure at least BASE schema
-            current = detect_state(conn)
+        def _do_migrate(conn: sqlite3.Connection) -> None:
+            """Ensure schema is ready before ingest. Migrations commit
+            internally (CREATE IF NOT EXISTS), so they are idempotent and
+            complete before the ingest transaction starts."""
+            current = self._schema_state_cache
+            if current is None:
+                current = detect_state(conn)
+
             if current < SchemaState.BASE:
                 migrate_to(conn, SchemaState.BASE)
+                current = SchemaState.BASE
 
-            # Insert parent document
-            cursor = conn.execute(
-                "INSERT INTO documents (content, metadata) VALUES (?, ?)",
-                (content, meta_str),
-            )
-            parent_id = cursor.lastrowid
-            assert parent_id is not None
-
-            # Insert chunks
-            chunk_ids: list[int] = []
-            for i, chunk_text in enumerate(chunks):
-                if has_chunker:
-                    cur = conn.execute(
-                        "INSERT INTO documents (content, metadata, chunk_of) "
-                        "VALUES (?, ?, ?)",
-                        (chunk_text, meta_str, parent_id),
-                    )
-                    chunk_id = cur.lastrowid
-                    assert chunk_id is not None
-                    chunk_ids.append(chunk_id)
-                else:
-                    chunk_ids.append(parent_id)
-
-            # Write lemmatized content
-            for cid, lem in zip(chunk_ids, lemmatized_chunks):
-                if lem is not None:
-                    conn.execute(
-                        "UPDATE documents SET content_lemmatized = ? WHERE id = ?",
-                        (lem, cid),
-                    )
-
-            # Write embeddings
             if vec_blobs is not None and vec_dim is not None:
-                validate_dimension(conn, vec_dim, commit=False)
-
-                current = detect_state(conn)
-                if current < SchemaState.INDEXED:
+                validate_dimension(conn, vec_dim, commit=True)
+                # Check for actual vec0 table, not numeric state,
+                # because SEARCHABLE(3) > INDEXED(2) but vec0 may be absent.
+                tables = {
+                    r[0] for r in conn.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type IN ('table', 'view')"
+                    ).fetchall()
+                }
+                if "documents_vec" not in tables:
                     migrate_to(conn, SchemaState.INDEXED, vec_dimension=vec_dim)
 
-                for cid, blob in zip(chunk_ids, vec_blobs):
-                    conn.execute(
-                        "INSERT OR REPLACE INTO documents_vec(rowid, embedding) "
-                        "VALUES (?, ?)",
-                        (cid, blob),
-                    )
-                    conn.execute(
-                        "UPDATE documents SET vec_indexed = 1 WHERE id = ?",
-                        (cid,),
-                    )
+            # Always re-detect after potential migrations
+            self._schema_state_cache = detect_state(conn)
 
-            # FTS sync for SEARCHABLE (no triggers) state
-            current = detect_state(conn)
-            if current >= SchemaState.SEARCHABLE:
-                for cid in chunk_ids:
-                    row = conn.execute(
-                        "SELECT content_lemmatized FROM documents WHERE id = ?",
-                        (cid,),
-                    ).fetchone()
-                    if row and row[0] and current < SchemaState.ENRICHED:
+        def _do_ingest(conn: sqlite3.Connection) -> int:
+            # Phase 2a: ensure schema is migrated (commits separately)
+            _do_migrate(conn)
+
+            # Phase 2b: all data operations in an explicit atomic transaction
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Insert parent document
+                cursor = conn.execute(
+                    "INSERT INTO documents (content, metadata) VALUES (?, ?)",
+                    (content, meta_str),
+                )
+                parent_id = cursor.lastrowid
+                assert parent_id is not None
+
+                # Insert chunks
+                chunk_ids: list[int] = []
+                for i, chunk_text in enumerate(chunks):
+                    if has_chunker:
+                        cur = conn.execute(
+                            "INSERT INTO documents (content, metadata, chunk_of) "
+                            "VALUES (?, ?, ?)",
+                            (chunk_text, meta_str, parent_id),
+                        )
+                        chunk_id = cur.lastrowid
+                        assert chunk_id is not None
+                        chunk_ids.append(chunk_id)
+                    else:
+                        chunk_ids.append(parent_id)
+
+                # Write lemmatized content
+                for cid, lem in zip(chunk_ids, lemmatized_chunks):
+                    if lem is not None:
                         conn.execute(
-                            "INSERT INTO documents_fts(rowid, content_lemmatized) "
+                            "UPDATE documents SET content_lemmatized = ? WHERE id = ?",
+                            (lem, cid),
+                        )
+
+                # Write embeddings
+                if vec_blobs is not None and vec_dim is not None:
+                    for cid, blob in zip(chunk_ids, vec_blobs):
+                        conn.execute(
+                            "INSERT OR REPLACE INTO documents_vec(rowid, embedding) "
                             "VALUES (?, ?)",
-                            (cid, row[0]),
+                            (cid, blob),
                         )
                         conn.execute(
-                            "UPDATE documents SET fts_indexed = 1 WHERE id = ?",
+                            "UPDATE documents SET vec_indexed = 1 WHERE id = ?",
                             (cid,),
                         )
 
-            conn.commit()
+                # FTS sync for SEARCHABLE (no triggers) state
+                current = self._schema_state_cache or SchemaState.EMPTY
+                if current >= SchemaState.SEARCHABLE:
+                    for cid in chunk_ids:
+                        row = conn.execute(
+                            "SELECT content_lemmatized FROM documents WHERE id = ?",
+                            (cid,),
+                        ).fetchone()
+                        if row and row[0] and current < SchemaState.ENRICHED:
+                            conn.execute(
+                                "INSERT INTO documents_fts(rowid, content_lemmatized) "
+                                "VALUES (?, ?)",
+                                (cid, row[0]),
+                            )
+                            conn.execute(
+                                "UPDATE documents SET fts_indexed = 1 WHERE id = ?",
+                                (cid,),
+                            )
+
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
             return parent_id
 
         return self.execute_on_writer(
@@ -881,22 +1005,31 @@ class SQFox:
         conn = self._get_reader_connection()
 
         if embed_fn is not None:
-            return hybrid_search(
-                conn,
-                query,
-                embed_fn,
-                lemmatize_fn=lemmatize_query,
-                limit=limit,
-                alpha=alpha,
-                reranker_fn=reranker_fn,
-                rerank_top_n=rerank_top_n,
-            )
+            try:
+                return hybrid_search(
+                    conn,
+                    query,
+                    embed_fn,
+                    lemmatize_fn=lemmatize_query,
+                    limit=limit,
+                    alpha=alpha,
+                    reranker_fn=reranker_fn,
+                    rerank_top_n=rerank_top_n,
+                )
+            except (sqlite3.OperationalError, SQFoxError) as exc:
+                logger.warning("Hybrid search failed: %s", exc)
+                return []
         else:
             # FTS-only search
+            if reranker_fn is not None:
+                logger.warning(
+                    "reranker_fn provided without embed_fn; "
+                    "reranker will not be applied to FTS-only results"
+                )
             query_lemmatized = lemmatize_query(query, None)
             try:
                 fts_results = fts_search(conn, query_lemmatized, limit=limit)
-            except Exception as exc:
+            except (sqlite3.OperationalError, SQFoxError) as exc:
                 logger.warning("FTS search failed: %s", exc)
                 return []
 
@@ -905,8 +1038,7 @@ class SQFox:
 
             # Hydrate
             import json as _json
-            doc_ids = [doc_id for doc_id, _ in fts_results]
-            score_map = {doc_id: score for doc_id, score in fts_results}
+            doc_ids = tuple(doc_id for doc_id, _ in fts_results)
             placeholders = ",".join(["?"] * len(doc_ids))
             rows = conn.execute(
                 f"SELECT id, content, metadata, chunk_of FROM documents "

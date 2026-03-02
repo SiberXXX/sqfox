@@ -1,9 +1,5 @@
 """Tests for sqfox search: normalization, fusion, RRF, adaptive alpha."""
 
-from pathlib import Path
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
 import pytest
 
 from sqfox.search import (
@@ -97,6 +93,10 @@ class TestScoreFusion:
         for _, score in result:
             assert 0.0 <= score <= 1.0
 
+    def test_both_empty(self):
+        result = score_fusion([], [])
+        assert result == []
+
 
 # ---------------------------------------------------------------------------
 # RRF fallback
@@ -133,6 +133,24 @@ class TestRRF:
         # Doc 1 should be top in both, but scores differ
         assert result_k2[0][0] == 1
         assert result_k100[0][0] == 1
+
+    def test_rrf_empty_inputs(self):
+        assert rrf_fallback([], []) == []
+        assert len(rrf_fallback([(1, 0.5)], [])) == 1
+        assert len(rrf_fallback([], [(1, 0.5)])) == 1
+
+    def test_alpha_weighting(self):
+        """alpha=0 means FTS-only, alpha=1 means vec-only."""
+        fts = [(1, 10.0), (2, 5.0)]
+        vec = [(3, 0.9), (4, 0.5)]
+        # Alpha=0: only FTS results should appear with non-zero scores
+        result_fts = rrf_fallback(fts, vec, alpha=0.0)
+        fts_ids = {r[0] for r in result_fts if r[1] > 0}
+        assert fts_ids == {1, 2}
+        # Alpha=1: only vec results should appear with non-zero scores
+        result_vec = rrf_fallback(fts, vec, alpha=1.0)
+        vec_ids = {r[0] for r in result_vec if r[1] > 0}
+        assert vec_ids == {3, 4}
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +200,15 @@ class TestAdaptiveAlpha:
         vec = [(i, 0.9 - i * 0.1) for i in range(5)]
         alpha = adaptive_alpha(query, fts, vec, base_alpha=0.5)
         assert 0.3 <= alpha <= 0.7
+
+    def test_adaptive_alpha_boundary_values(self):
+        """Alpha stays in [0, 1] range with extreme inputs."""
+        fts = [(i, float(i)) for i in range(10)]
+        vec = [(i, float(i)) for i in range(10)]
+        a = adaptive_alpha("test", fts, vec, base_alpha=0.0)
+        assert 0.0 <= a <= 1.0
+        a = adaptive_alpha("test", fts, vec, base_alpha=1.0)
+        assert 0.0 <= a <= 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +282,8 @@ class TestReranker:
         def dummy_embed(texts):
             return [[0.0] * 4 for _ in texts]
 
-        def reverse_reranker(query, texts):
+        def reversing_reranker(query, texts):
+            """Assign ascending scores so last candidate becomes first."""
             return [float(i) for i in range(len(texts))]
 
         results_no_rerank = hybrid_search(
@@ -263,13 +291,19 @@ class TestReranker:
         )
         results_reranked = hybrid_search(
             conn, "python", dummy_embed, limit=5,
-            reranker_fn=reverse_reranker,
+            reranker_fn=reversing_reranker,
         )
 
-        if len(results_no_rerank) >= 2 and len(results_reranked) >= 2:
-            no_rerank_ids = [r.doc_id for r in results_no_rerank]
-            reranked_ids = [r.doc_id for r in results_reranked]
-            assert no_rerank_ids != reranked_ids
+        assert len(results_no_rerank) >= 2, "FTS should find at least 2 python docs"
+        assert len(results_reranked) >= 2, "Reranked should also have at least 2"
+
+        no_rerank_ids = [r.doc_id for r in results_no_rerank]
+        reranked_ids = [r.doc_id for r in results_reranked]
+        # With reversing reranker, the order must be reversed
+        assert reranked_ids == list(reversed(no_rerank_ids)), (
+            f"Reranker should reverse the order: "
+            f"original={no_rerank_ids}, reranked={reranked_ids}"
+        )
 
         conn.close()
 
@@ -290,8 +324,8 @@ class TestReranker:
             reranker_fn=fixed_reranker,
         )
 
-        if results:
-            assert all(r.score >= 99.0 for r in results)
+        assert len(results) >= 1, "Search should return results"
+        assert all(r.score >= 99.0 for r in results)
 
         conn.close()
 
@@ -356,4 +390,158 @@ class TestReranker:
 
         assert seen_counts
         assert seen_counts[0] <= 3
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# fts_search / vec_search unit tests
+# ---------------------------------------------------------------------------
+
+class TestFtsSearch:
+    """Direct tests for fts_search (bypassing hybrid_search)."""
+
+    def _make_fts_db(self, tmp_path):
+        import sqlite3
+        from sqfox.schema import migrate_to
+        from sqfox.types import SchemaState
+
+        db_path = str(tmp_path / "fts_unit.db")
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        migrate_to(conn, SchemaState.SEARCHABLE)
+
+        docs = [
+            (1, "python programming language", "python program language"),
+            (2, "java enterprise development", "java enterprise develop"),
+            (3, "python web framework flask", "python web framework flask"),
+        ]
+        for doc_id, content, lemmatized in docs:
+            conn.execute(
+                "INSERT INTO documents (id, content, content_lemmatized, fts_indexed) "
+                "VALUES (?, ?, ?, 1)",
+                (doc_id, content, lemmatized),
+            )
+            conn.execute(
+                "INSERT INTO documents_fts(rowid, content_lemmatized) VALUES (?, ?)",
+                (doc_id, lemmatized),
+            )
+        conn.commit()
+        return conn
+
+    def test_fts_basic_match(self, tmp_path):
+        from sqfox.search import fts_search
+        conn = self._make_fts_db(tmp_path)
+        results = fts_search(conn, "python", limit=10)
+        assert len(results) == 2
+        doc_ids = [r[0] for r in results]
+        assert 1 in doc_ids
+        assert 3 in doc_ids
+        conn.close()
+
+    def test_fts_no_match(self, tmp_path):
+        from sqfox.search import fts_search
+        conn = self._make_fts_db(tmp_path)
+        results = fts_search(conn, "rust", limit=10)
+        assert results == []
+        conn.close()
+
+    def test_fts_empty_query(self, tmp_path):
+        from sqfox.search import fts_search
+        conn = self._make_fts_db(tmp_path)
+        assert fts_search(conn, "", limit=10) == []
+        assert fts_search(conn, "   ", limit=10) == []
+        conn.close()
+
+    def test_fts_special_chars(self, tmp_path):
+        from sqfox.search import fts_search
+        conn = self._make_fts_db(tmp_path)
+        # These should not crash FTS5
+        # Quotes are stripped by sanitizer, so "python" becomes python
+        results = fts_search(conn, '"python"', limit=10)
+        assert len(results) == 2, f"Quoted query should match 2 docs, got {len(results)}"
+        # Asterisk is stripped by sanitizer, so python* becomes python
+        results = fts_search(conn, "python*", limit=10)
+        assert len(results) == 2, f"Prefix query should match 2 docs, got {len(results)}"
+        results = fts_search(conn, "---", limit=10)
+        assert results == []
+        conn.close()
+
+    def test_fts_limit(self, tmp_path):
+        from sqfox.search import fts_search
+        conn = self._make_fts_db(tmp_path)
+        results = fts_search(conn, "python", limit=1)
+        assert len(results) == 1
+        conn.close()
+
+    def test_fts_scores_positive(self, tmp_path):
+        from sqfox.search import fts_search
+        conn = self._make_fts_db(tmp_path)
+        results = fts_search(conn, "python", limit=10)
+        for _, score in results:
+            assert score > 0, "FTS scores should be positive (negated BM25)"
+        conn.close()
+
+
+class TestVecSearch:
+    """Direct tests for vec_search (bypassing hybrid_search)."""
+
+    def _make_vec_db(self, tmp_path):
+        import sqlite3
+        import struct
+        conn = sqlite3.connect(str(tmp_path / "vec_unit.db"))
+        conn.row_factory = sqlite3.Row
+
+        try:
+            conn.enable_load_extension(True)
+            import sqlite_vec
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except (ImportError, AttributeError):
+            pytest.skip("sqlite-vec not available")
+
+        from sqfox.schema import migrate_to
+        from sqfox.types import SchemaState
+        migrate_to(conn, SchemaState.INDEXED, vec_dimension=4)
+
+        # Insert test vectors
+        vecs = [
+            (1, [1.0, 0.0, 0.0, 0.0]),  # unit x
+            (2, [0.0, 1.0, 0.0, 0.0]),  # unit y
+            (3, [0.7, 0.7, 0.0, 0.0]),  # between x and y
+        ]
+        for doc_id, vec in vecs:
+            conn.execute(
+                "INSERT INTO documents (id, content) VALUES (?, ?)",
+                (doc_id, f"doc {doc_id}"),
+            )
+            blob = struct.pack("4f", *vec)
+            conn.execute(
+                "INSERT INTO documents_vec(rowid, embedding) VALUES (?, ?)",
+                (doc_id, blob),
+            )
+        conn.commit()
+        return conn
+
+    def test_vec_basic_search(self, tmp_path):
+        from sqfox.search import vec_search
+        conn = self._make_vec_db(tmp_path)
+        results = vec_search(conn, [1.0, 0.0, 0.0, 0.0], limit=3)
+        assert len(results) == 3
+        # Closest to [1,0,0,0] should be doc 1
+        assert results[0][0] == 1
+        conn.close()
+
+    def test_vec_scores_positive(self, tmp_path):
+        from sqfox.search import vec_search
+        conn = self._make_vec_db(tmp_path)
+        results = vec_search(conn, [1.0, 0.0, 0.0, 0.0], limit=3)
+        for _, score in results:
+            assert 0 < score <= 1.0, f"Vec score should be in (0, 1], got {score}"
+        conn.close()
+
+    def test_vec_limit(self, tmp_path):
+        from sqfox.search import vec_search
+        conn = self._make_vec_db(tmp_path)
+        results = vec_search(conn, [1.0, 0.0, 0.0, 0.0], limit=1)
+        assert len(results) == 1
         conn.close()

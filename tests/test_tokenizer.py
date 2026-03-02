@@ -1,9 +1,5 @@
 """Tests for sqfox tokenizer: language detection, tokenization, lemmatization."""
 
-from pathlib import Path
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
 import pytest
 
 from sqfox.tokenizer import detect_lang, tokenize, lemmatize, lemmatize_query

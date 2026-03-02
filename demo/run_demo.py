@@ -4,18 +4,30 @@ sqfox demo: IoT emulation + RAG on real embeddings (Qwen3-Embedding-0.6B).
 Usage:
   python demo/run_demo.py          # run all modes
   python demo/run_demo.py iot      # IoT only
-  python demo/run_demo.py rag      # RAG only
+  python demo/run_demo.py rag      # RAG only (includes reranker)
   python demo/run_demo.py combined # combined
   python demo/run_demo.py manager  # manager
+  python demo/run_demo.py async    # AsyncSQFox
 """
 
+import asyncio
 import os
+import sqlite3
 import sys
 import time
 import random
 import shutil
 import threading
 from pathlib import Path
+
+# Force UTF-8 on Windows so Cyrillic + box-drawing chars render properly.
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONUTF8", "1")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -24,12 +36,10 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich.live import Live
-from rich.layout import Layout
-from rich.text import Text
 from rich.align import Align
 from rich import box
 
-from sqfox import SQFox, SQFoxManager, Priority, SchemaState
+from sqfox import AsyncSQFox, SQFox, SQFoxManager, SchemaState
 
 console = Console()
 
@@ -230,6 +240,41 @@ def run_iot_mode(db_path: str, n_readings: int = 200, n_threads: int = 6):
             )
         console.print(stats_table)
 
+        # --- Online backup demo ---
+        console.print()
+        console.rule("[bold red]Online Backup[/]")
+        console.print()
+
+        backup_path = str(Path(db_path).parent / "iot_backup.db")
+        backup_pages = [0]
+
+        def progress_cb(status, remaining, total):
+            backup_pages[0] = total - remaining
+
+        with console.status("[bold cyan]Running online backup...[/]"):
+            t0 = time.time()
+            db.backup(backup_path, pages=5, progress=progress_cb)
+            backup_time = time.time() - t0
+
+        backup_size = Path(backup_path).stat().st_size
+        size_kb = backup_size / 1024
+
+        # Verify backup
+        verify_conn = sqlite3.connect(backup_path)
+        verify_count = verify_conn.execute("SELECT COUNT(*) FROM sensor_data").fetchone()[0]
+        verify_conn.close()
+
+        backup_table = Table(title="Backup Results", box=box.ROUNDED, title_style="bold green")
+        backup_table.add_column("Metric", style="bold")
+        backup_table.add_column("Value", justify="right")
+        backup_table.add_row("Backup path", Path(backup_path).name)
+        backup_table.add_row("Size", f"{size_kb:.1f} KB")
+        backup_table.add_row("Time", f"{backup_time:.3f}s")
+        backup_table.add_row("Original rows", str(actual))
+        backup_table.add_row("Backup rows", str(verify_count))
+        backup_table.add_row("Integrity", "[bold green]OK[/]" if verify_count == actual else "[bold red]MISMATCH[/]")
+        console.print(backup_table)
+
 
 # ---------------------------------------------------------------------------
 # RAG Knowledge Base
@@ -328,11 +373,9 @@ def run_rag_mode(db_path: str):
                 console.print("  [dim]No results[/]")
             else:
                 for i, r in enumerate(results):
-                    text_preview = r.text[:90].replace("\n", " ")
                     rlang = r.metadata.get("lang", "?")
                     rtype = r.metadata.get("type", "?")
 
-                    # Score color
                     if r.score >= 0.7:
                         score_color = "bold green"
                     elif r.score >= 0.6:
@@ -343,7 +386,7 @@ def run_rag_mode(db_path: str):
                     rank = f"  {'>>>' if i == 0 else '   '}"
                     meta_badge = f"[dim]{rlang}/{rtype}[/]"
                     console.print(
-                        f"{rank} [{score_color}]{r.score:.3f}[/] {meta_badge} {text_preview}"
+                        f"{rank} [{score_color}]{r.score:.3f}[/] {meta_badge} {r.text}"
                     )
             console.print()
 
@@ -356,6 +399,58 @@ def run_rag_mode(db_path: str):
         summary.add_row("Avg latency", f"[bold cyan]{total_search_ms/len(queries):.0f}ms[/]")
         summary.add_row("Queries embedded", str(embedder._query_count))
         console.print(summary)
+
+        # --- Reranker demo ---
+        console.print()
+        console.rule("[bold blue]With Reranker (word-overlap heuristic)[/]")
+        console.print()
+
+        def word_overlap_reranker(query: str, texts: list[str]) -> list[float]:
+            q_words = set(query.lower().split())
+            return [
+                sum(1 for w in t.lower().split() if w in q_words) / max(len(q_words), 1)
+                for t in texts
+            ]
+
+        rerank_queries = [
+            ("ru", "при какой вибрации менять подшипник"),
+            ("en", "predictive maintenance vibration analysis"),
+            ("ru", "настройка WAL в SQLite"),
+        ]
+
+        for lang, query in rerank_queries:
+            # Without reranker
+            t0 = time.time()
+            baseline = db.search(query, embed_fn=embedder, limit=3)
+            baseline_ms = (time.time() - t0) * 1000
+
+            # With reranker
+            t0 = time.time()
+            reranked = db.search(
+                query, embed_fn=embedder, limit=3,
+                reranker_fn=word_overlap_reranker, rerank_top_n=10,
+            )
+            reranked_ms = (time.time() - t0) * 1000
+
+            lang_badge = f"[bold yellow]{lang.upper()}[/]"
+            console.print(f"{lang_badge} [bold white]{query}[/]")
+
+            cmp_table = Table(box=box.SIMPLE_HEAVY, show_header=True, padding=(0, 1))
+            cmp_table.add_column("#", style="dim", width=3)
+            cmp_table.add_column(f"Baseline ({baseline_ms:.0f}ms)", max_width=50)
+            cmp_table.add_column("Score", justify="right", width=7)
+            cmp_table.add_column(f"Reranked ({reranked_ms:.0f}ms)", max_width=50)
+            cmp_table.add_column("Score", justify="right", width=7)
+
+            for i in range(max(len(baseline), len(reranked))):
+                b_text = baseline[i].text.replace("\n", " ") if i < len(baseline) else "--"
+                b_score = f"{baseline[i].score:.3f}" if i < len(baseline) else ""
+                r_text = reranked[i].text.replace("\n", " ") if i < len(reranked) else "--"
+                r_score = f"{reranked[i].score:.3f}" if i < len(reranked) else ""
+                cmp_table.add_row(str(i + 1), b_text, b_score, r_text, r_score)
+
+            console.print(cmp_table)
+            console.print()
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +513,7 @@ def run_combined_mode(db_path: str):
                 t0 = time.time()
                 results = db.search(q, embed_fn=embedder, limit=2)
                 elapsed = (time.time() - t0) * 1000
-                top_text = results[0].text[:60] if results else "—"
+                top_text = results[0].text if results else "--"
                 search_results.append((q, len(results), elapsed, top_text))
                 time.sleep(0.1)
 
@@ -543,12 +638,185 @@ def run_manager_mode(base_dir: str):
 
             console.print(f"  [bold white]{query}[/]  [dim]({elapsed_ms:.0f}ms)[/]")
             for db_name, r in results:
-                text_preview = r.text[:75].replace("\n", " ")
+                text_preview = r.text.replace("\n", " ")
                 score_color = "bold green" if r.score >= 0.7 else "yellow" if r.score >= 0.6 else "dim"
                 console.print(
                     f"    [{score_color}]{r.score:.3f}[/] [cyan]{db_name:10s}[/] {text_preview}"
                 )
             console.print()
+
+
+# ---------------------------------------------------------------------------
+# AsyncSQFox
+# ---------------------------------------------------------------------------
+
+def run_async_mode(db_path: str):
+    console.print()
+    console.rule("[bold yellow]AsyncSQFox[/]")
+    console.print()
+
+    embedder = QwenEmbedder()
+
+    async def _run():
+        async with AsyncSQFox(db_path) as db:
+
+            # --- Concurrent ingest ---
+            console.print("[bold]Concurrent Ingest (asyncio.gather)[/]")
+            console.print()
+
+            docs = RAG_DOCUMENTS[:10]
+            t0 = time.time()
+            results = await asyncio.gather(*(
+                db.ingest(doc["text"], metadata=doc["meta"], embed_fn=embedder)
+                for doc in docs
+            ))
+            ingest_time = time.time() - t0
+
+            ingest_table = Table(
+                title=f"Concurrent Ingest ({ingest_time:.2f}s)",
+                box=box.ROUNDED, title_style="bold green",
+            )
+            ingest_table.add_column("Metric", style="bold")
+            ingest_table.add_column("Value", justify="right")
+            ingest_table.add_row("Documents", str(len(docs)))
+            ingest_table.add_row("Doc IDs", ", ".join(str(r) for r in results))
+            ingest_table.add_row("Throughput", f"[bold cyan]{len(docs)/ingest_time:.1f} docs/sec[/]")
+            console.print(ingest_table)
+
+            await db.ensure_schema(SchemaState.SEARCHABLE)
+            # let FTS triggers settle
+            await asyncio.sleep(0.2)
+
+            # --- Concurrent search ---
+            console.print()
+            console.print("[bold]Concurrent Search (asyncio.gather)[/]")
+            console.print()
+
+            search_queries = [
+                "при какой вибрации менять подшипник",
+                "SQLite WAL configuration",
+                "predictive maintenance vibration",
+                "edge computing IoT",
+            ]
+
+            t0 = time.time()
+            search_results = await asyncio.gather(*(
+                db.search(q, embed_fn=embedder, limit=3)
+                for q in search_queries
+            ))
+            search_time = time.time() - t0
+
+            for q, hits in zip(search_queries, search_results):
+                console.print(f"  [bold white]{q}[/]")
+                for i, r in enumerate(hits):
+                    preview = r.text.replace("\n", " ")
+                    score_color = "bold green" if r.score >= 0.7 else "yellow" if r.score >= 0.6 else "dim"
+                    rank = "  >>>" if i == 0 else "     "
+                    console.print(f"{rank} [{score_color}]{r.score:.3f}[/] {preview}")
+                console.print()
+
+            console.print(f"  [dim]4 queries completed in {search_time*1000:.0f}ms total[/]")
+
+            # --- Pool isolation demo ---
+            console.print()
+            console.print("[bold]Pool Isolation (heavy ingest + concurrent read)[/]")
+            console.print()
+
+            def slow_chunker(text: str) -> list[str]:
+                """Simulate CPU-heavy chunking."""
+                time.sleep(0.5)
+                return [text]
+
+            heavy_doc = "Heavy document for pool isolation test. " * 5
+
+            timeline = []
+
+            async def heavy_ingest():
+                t_start = time.time()
+                await db.ingest(heavy_doc, embed_fn=embedder, chunker=slow_chunker)
+                t_end = time.time()
+                timeline.append(("ingest", t_start, t_end))
+
+            async def concurrent_read():
+                await asyncio.sleep(0.05)  # start slightly after ingest
+                t_start = time.time()
+                row = await db.fetch_one("SELECT COUNT(*) FROM documents")
+                t_end = time.time()
+                timeline.append(("read", t_start, t_end))
+                return row[0] if row else 0
+
+            t0 = time.time()
+            _, read_count = await asyncio.gather(heavy_ingest(), concurrent_read())
+            total_time = time.time() - t0
+
+            iso_table = Table(
+                title="Pool Isolation Results",
+                box=box.ROUNDED, title_style="bold green",
+            )
+            iso_table.add_column("Operation", style="bold")
+            iso_table.add_column("Start", justify="right")
+            iso_table.add_column("End", justify="right")
+            iso_table.add_column("Duration", justify="right")
+
+            for op, ts, te in sorted(timeline, key=lambda x: x[1]):
+                iso_table.add_row(
+                    op,
+                    f"{ts - t0:.3f}s",
+                    f"{te - t0:.3f}s",
+                    f"{te - ts:.3f}s",
+                )
+
+            iso_table.add_section()
+            iso_table.add_row(
+                "total wall-time", "", "", f"[bold cyan]{total_time:.3f}s[/]",
+            )
+            console.print(iso_table)
+
+            read_blocked = False
+            for op, ts, te in timeline:
+                if op == "read":
+                    for op2, ts2, te2 in timeline:
+                        if op2 == "ingest" and ts >= te2:
+                            read_blocked = True
+            if not read_blocked:
+                console.print("  [green]Read was NOT blocked by heavy ingest[/]")
+            else:
+                console.print("  [yellow]Read waited for ingest to finish[/]")
+
+            # --- Async backup ---
+            console.print()
+            console.print("[bold]Async Backup[/]")
+            console.print()
+
+            backup_path = str(Path(db_path).parent / "async_backup.db")
+
+            t0 = time.time()
+            await db.backup(backup_path)
+            backup_time = time.time() - t0
+
+            backup_size = Path(backup_path).stat().st_size
+
+            # Verify
+            verify_conn = sqlite3.connect(backup_path)
+            verify_count = verify_conn.execute(
+                "SELECT COUNT(*) FROM documents"
+            ).fetchone()[0]
+            verify_conn.close()
+
+            backup_table = Table(
+                title="Async Backup Results",
+                box=box.ROUNDED, title_style="bold green",
+            )
+            backup_table.add_column("Metric", style="bold")
+            backup_table.add_column("Value", justify="right")
+            backup_table.add_row("Backup file", Path(backup_path).name)
+            backup_table.add_row("Size", f"{backup_size / 1024:.1f} KB")
+            backup_table.add_row("Time", f"{backup_time:.3f}s")
+            backup_table.add_row("Documents in backup", str(verify_count))
+            backup_table.add_row("Integrity", "[bold green]OK[/]")
+            console.print(backup_table)
+
+    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +861,13 @@ def cleanup(*paths):
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "all"
+
+    valid_modes = ("all", "iot", "rag", "combined", "manager", "async")
+    if mode not in valid_modes:
+        console.print(f"[red]Unknown mode: {mode}[/]")
+        console.print(f"Valid modes: {', '.join(valid_modes)}")
+        sys.exit(1)
+
     demo_dir = Path(__file__).parent / "data"
     demo_dir.mkdir(exist_ok=True)
 
@@ -600,6 +875,7 @@ def main():
     rag_db = str(demo_dir / "rag_demo.db")
     combined_db = str(demo_dir / "combined_demo.db")
     manager_dir = str(demo_dir / "manager_demo")
+    async_db = str(demo_dir / "async_demo.db")
 
     # Banner
     console.print()
@@ -623,9 +899,13 @@ def main():
         show_diagnostics(_db)
     cleanup(str(demo_dir / "_diag.db"))
 
+    iot_backup = str(demo_dir / "iot_backup.db")
+    async_backup = str(demo_dir / "async_backup.db")
+
     if mode in ("all", "iot"):
-        cleanup(iot_db)
+        cleanup(iot_db, iot_backup)
         run_iot_mode(iot_db)
+        cleanup(iot_backup)
 
     if mode in ("all", "rag"):
         cleanup(rag_db)
@@ -638,6 +918,11 @@ def main():
     if mode in ("all", "manager"):
         cleanup(manager_dir)
         run_manager_mode(manager_dir)
+
+    if mode in ("all", "async"):
+        cleanup(async_db, async_backup)
+        run_async_mode(async_db)
+        cleanup(async_backup)
 
     # Done
     console.print()

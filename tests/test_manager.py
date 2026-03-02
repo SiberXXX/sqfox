@@ -1,12 +1,8 @@
 """Tests for sqfox manager: multi-database lifecycle, cross-search, drop."""
 
 import time
-from pathlib import Path
 
 import pytest
-
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from sqfox import SQFoxManager, SQFox
 

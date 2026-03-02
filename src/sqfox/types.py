@@ -5,7 +5,7 @@ from __future__ import annotations
 import enum
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +109,16 @@ class WriteRequest:
         future:   Optional Future for the caller to await the result
                   or catch exceptions.
         many:     If True, use executemany instead of execute.
+        fn:       Optional callable for ``execute_on_writer``.  When set,
+                  ``sql`` and ``params`` are ignored — the callable receives
+                  the writer's ``sqlite3.Connection`` directly.
+
+    Note:
+        This dataclass intentionally does NOT define ordering (__lt__ etc.).
+        PriorityQueue comparisons are handled by the (priority, seq, request)
+        tuple wrapper — the seq field breaks ties so WriteRequest.__lt__ is
+        never reached.  If direct comparison is attempted it will raise
+        TypeError, which is the desired behaviour (fail-fast).
     """
 
     sql: str
@@ -116,6 +126,7 @@ class WriteRequest:
     priority: Priority = Priority.NORMAL
     future: Future[Any] | None = None
     many: bool = False
+    fn: Callable[..., Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +207,10 @@ def embed_for_documents(
             "Object has embed_documents() but not embed_query(). "
             "Implement both methods for correct instruction-aware embedding."
         )
+    if not callable(embed_fn):
+        raise TypeError(
+            f"embed_fn must be callable or implement Embedder protocol, got {type(embed_fn)}"
+        )
     return embed_fn(texts)  # type: ignore[call-arg]
 
 
@@ -216,5 +231,9 @@ def embed_for_query(
         logging.getLogger("sqfox.types").warning(
             "Object has embed_query() but not embed_documents(). "
             "Implement both methods for correct instruction-aware embedding."
+        )
+    if not callable(embed_fn):
+        raise TypeError(
+            f"embed_fn must be callable or implement Embedder protocol, got {type(embed_fn)}"
         )
     return embed_fn([text])[0]  # type: ignore[call-arg]

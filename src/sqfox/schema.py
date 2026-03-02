@@ -76,44 +76,67 @@ def migrate_to(
     Migrations are idempotent — running them twice has no effect.
     Returns the achieved state.
 
+    Note:
+        INDEXED (vec0) and SEARCHABLE (FTS5) are independent capabilities.
+        The numeric ordering in SchemaState is a convenience, not a strict
+        dependency chain.  This function checks for the *existence* of
+        individual tables rather than relying solely on numeric comparison,
+        so that e.g. requesting INDEXED when FTS5 already exists (state ==
+        SEARCHABLE) still creates the vec0 table correctly.
+
     Raises:
         SchemaError: If migration fails or target requires vec_dimension
                      but none is provided.
     """
-    current = detect_state(conn)
-    if current >= target:
-        return current
+    # Inspect actual table/trigger existence.  We do NOT rely on numeric
+    # SchemaState comparison for the early-return because INDEXED and
+    # SEARCHABLE are orthogonal capabilities:
+    #   SEARCHABLE(3) > INDEXED(2), but that doesn't mean vec0 exists.
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+        ).fetchall()
+    }
+    triggers = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall()
+    }
 
-    if current < SchemaState.BASE:
+    has_base = "_sqfox_meta" in tables and "documents" in tables
+    has_vec = "documents_vec" in tables
+    has_fts = "documents_fts" in tables
+    has_triggers = (
+        "sqfox_fts_insert" in triggers
+        and "sqfox_fts_delete" in triggers
+        and "sqfox_fts_update" in triggers
+    )
+
+    # --- BASE: core tables ---
+    if not has_base and target >= SchemaState.BASE:
         _migrate_to_base(conn)
-        current = SchemaState.BASE
 
-    # INDEXED requires vec_dimension. SEARCHABLE can work without it.
-    # ENRICHED requires both vec0 + FTS5, so it also needs vec_dimension.
-    needs_vec = target == SchemaState.INDEXED or target == SchemaState.ENRICHED
+    # --- INDEXED: vec0 table ---
+    needs_vec = target in (SchemaState.INDEXED, SchemaState.ENRICHED)
 
-    if current < SchemaState.INDEXED and vec_dimension is not None:
+    if not has_vec and vec_dimension is not None:
         _migrate_to_indexed(conn, vec_dimension)
-        current = SchemaState.INDEXED
-    elif needs_vec and vec_dimension is None:
+    elif needs_vec and not has_vec and vec_dimension is None:
         raise SchemaError(
             "vec_dimension is required to create the vector index"
         )
 
-    # SEARCHABLE — FTS5 can exist independently of vec0
-    if target >= SchemaState.SEARCHABLE and current < SchemaState.SEARCHABLE:
+    # --- SEARCHABLE: FTS5 table ---
+    if target >= SchemaState.SEARCHABLE and not has_fts:
         _migrate_to_searchable(conn)
-        # Re-detect since SEARCHABLE or ENRICHED depends on what exists
-        current = detect_state(conn)
 
-    # ENRICHED — requires both vec0 and FTS5
-    if target >= SchemaState.ENRICHED and current < SchemaState.ENRICHED:
-        if detect_state(conn) < SchemaState.SEARCHABLE:
-            _migrate_to_searchable(conn)
+    # --- ENRICHED: sync triggers (requires both vec0 and FTS5) ---
+    if target >= SchemaState.ENRICHED and not has_triggers:
         _migrate_to_enriched(conn)
-        current = detect_state(conn)
 
-    return current
+    return detect_state(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +181,10 @@ def _migrate_to_base(conn: sqlite3.Connection) -> None:
 
 def _migrate_to_indexed(conn: sqlite3.Connection, vec_dimension: int) -> None:
     """Create vec0 virtual table and store dimension in meta."""
+    if not isinstance(vec_dimension, int) or vec_dimension <= 0:
+        raise SchemaError(
+            f"vec_dimension must be a positive integer, got {vec_dimension!r}"
+        )
     conn.execute(
         f"CREATE VIRTUAL TABLE IF NOT EXISTS documents_vec "
         f"USING vec0(embedding float[{vec_dimension}])"
@@ -292,6 +319,7 @@ def backfill_vectors(
     Designed to be called incrementally (resumable).
     """
     processed = 0
+    dimension_validated = False
 
     while True:
         rows = conn.execute(
@@ -312,6 +340,14 @@ def backfill_vectors(
                 f"{len(rows)} texts — must return exactly one embedding per text"
             )
 
+        # Validate dimension once, before any batch transaction.
+        # commit=True ensures the dimension write completes its own
+        # transaction so the subsequent BEGIN doesn't conflict.
+        if not dimension_validated and embeddings:
+            validate_dimension(conn, len(embeddings[0]), commit=True)
+            dimension_validated = True
+
+        conn.execute("BEGIN")
         for row, embedding in zip(rows, embeddings):
             vec_blob = struct.pack(f"{len(embedding)}f", *embedding)
             conn.execute(
@@ -323,7 +359,6 @@ def backfill_vectors(
                 "UPDATE documents SET vec_indexed = 1 WHERE id = ?",
                 (row[0],),
             )
-
         conn.commit()
         processed += len(rows)
 
@@ -357,26 +392,38 @@ def backfill_fts(
         if not rows:
             break
 
-        for row in rows:
-            lemmatized = lemmatize_fn(row[1])
-            conn.execute(
-                "UPDATE documents SET content_lemmatized = ? WHERE id = ?",
-                (lemmatized, row[0]),
-            )
-
-            if not has_triggers:
-                # Manually insert into FTS
+        conn.execute("BEGIN")
+        try:
+            for row in rows:
+                if row[1] is None:
+                    # Mark as indexed so we don't re-process on next batch
+                    conn.execute(
+                        "UPDATE documents SET fts_indexed = 1 WHERE id = ?",
+                        (row[0],),
+                    )
+                    continue
+                lemmatized = lemmatize_fn(row[1])
                 conn.execute(
-                    "INSERT INTO documents_fts(rowid, content_lemmatized) "
-                    "VALUES (?, ?)",
-                    (row[0], lemmatized),
-                )
-                conn.execute(
-                    "UPDATE documents SET fts_indexed = 1 WHERE id = ?",
-                    (row[0],),
+                    "UPDATE documents SET content_lemmatized = ? WHERE id = ?",
+                    (lemmatized, row[0]),
                 )
 
-        conn.commit()
+                if not has_triggers:
+                    # Manually insert into FTS
+                    conn.execute(
+                        "INSERT INTO documents_fts(rowid, content_lemmatized) "
+                        "VALUES (?, ?)",
+                        (row[0], lemmatized),
+                    )
+                    conn.execute(
+                        "UPDATE documents SET fts_indexed = 1 WHERE id = ?",
+                        (row[0],),
+                    )
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         processed += len(rows)
 
     return processed

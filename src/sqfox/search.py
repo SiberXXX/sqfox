@@ -45,17 +45,33 @@ def fts_search(
     if not query_lemmatized.strip():
         return []
 
-    rows = conn.execute(
-        """
-        SELECT d.id, -bm25(documents_fts) as score
-        FROM documents_fts f
-        JOIN documents d ON d.id = f.rowid
-        WHERE documents_fts MATCH ?
-        ORDER BY score DESC
-        LIMIT ?
-        """,
-        (query_lemmatized, limit),
-    ).fetchall()
+    # Sanitize FTS5 special characters to prevent syntax errors.
+    # Quotes, parentheses, asterisks, carets can crash FTS5 MATCH.
+    # Colons trigger column filters, leading hyphens act as NOT prefix.
+    safe_query = query_lemmatized
+    for ch in '"\'()*^{}[]:+~|':
+        safe_query = safe_query.replace(ch, " ")
+    # Remove leading hyphens on tokens (FTS5 NOT operator) and standalone dashes
+    safe_query = re.sub(r"(?:^|\s)-+", " ", safe_query)
+    safe_query = safe_query.strip()
+    if not safe_query:
+        return []
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT d.id, -bm25(documents_fts) as score
+            FROM documents_fts f
+            JOIN documents d ON d.id = f.rowid
+            WHERE documents_fts MATCH ?
+            ORDER BY score DESC
+            LIMIT ?
+            """,
+            (safe_query, limit),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        logger.warning("FTS5 query failed (bad syntax?): %s", exc)
+        return []
 
     return [(row[0], row[1]) for row in rows]
 
@@ -78,14 +94,21 @@ def vec_search(
         Scores are converted so higher = better: score = 1 / (1 + distance).
     """
     vec_blob = struct.pack(f"{len(query_embedding)}f", *query_embedding)
-    rows = conn.execute(
-        """
-        SELECT rowid, distance
-        FROM documents_vec
-        WHERE embedding MATCH ? AND k = ?
-        """,
-        (vec_blob, limit),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """
+            SELECT rowid, distance
+            FROM documents_vec
+            WHERE embedding MATCH ? AND k = ?
+            """,
+            (vec_blob, limit),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        logger.warning(
+            "Vector search failed (documents_vec table may not exist "
+            "or dimension mismatch): %s", exc,
+        )
+        return []
 
     # Convert distance to relevance: higher = better
     return [(row[0], 1.0 / (1.0 + row[1])) for row in rows]

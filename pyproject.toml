@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "sqfox"
 version = "0.1.2"
-description = "Lightweight, thread-safe SQLite wrapper with hybrid search (FTS5 + vectors)"
+description = "Embedded SQLite micro-framework for hybrid search (FTS5 + vectors), IoT and RAG"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -24,7 +24,7 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Text Processing :: Indexing",
 ]
-keywords = ["sqlite", "search", "fts5", "vector", "rag", "edge", "iot"]
+keywords = ["sqlite", "search", "fts5", "vector", "rag", "edge", "iot", "embedded", "framework"]
 dependencies = []
 
 [project.optional-dependencies]

@@ -2,14 +2,8 @@
 
 import json
 import sqlite3
-import struct
-import tempfile
-from pathlib import Path
 
 import pytest
-
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from sqfox.schema import (
     detect_state,
@@ -142,7 +136,91 @@ class TestMigrations:
         migrate_to(conn, SchemaState.BASE)
         # Calling migrate_to with lower target returns current
         result = migrate_to(conn, SchemaState.EMPTY)
-        assert result >= SchemaState.BASE
+        assert result == SchemaState.BASE
+
+    def test_migrate_searchable_then_indexed(self, conn):
+        """INDEXED (vec0) can be added after SEARCHABLE (FTS5).
+
+        This verifies that the orthogonal capabilities don't block each
+        other despite SEARCHABLE(3) > INDEXED(2) numerically.
+        """
+        try:
+            conn.enable_load_extension(True)
+            import sqlite_vec
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except (ImportError, AttributeError):
+            pytest.skip("sqlite-vec not available")
+
+        # First create SEARCHABLE (FTS5 only)
+        migrate_to(conn, SchemaState.SEARCHABLE)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+            ).fetchall()
+        }
+        assert "documents_fts" in tables
+        assert "documents_vec" not in tables
+
+        # Now request INDEXED — vec0 should be created
+        migrate_to(conn, SchemaState.INDEXED, vec_dimension=128)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+            ).fetchall()
+        }
+        assert "documents_vec" in tables
+        assert "documents_fts" in tables  # FTS still exists
+
+    def test_migrate_indexed_then_enriched(self, conn):
+        """ENRICHED can be reached from INDEXED (adds FTS + triggers)."""
+        try:
+            conn.enable_load_extension(True)
+            import sqlite_vec
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except (ImportError, AttributeError):
+            pytest.skip("sqlite-vec not available")
+
+        migrate_to(conn, SchemaState.INDEXED, vec_dimension=64)
+        result = migrate_to(conn, SchemaState.ENRICHED, vec_dimension=64)
+        assert result == SchemaState.ENRICHED
+
+    def test_migrate_searchable_then_enriched(self, conn):
+        """ENRICHED can be reached from SEARCHABLE."""
+        try:
+            conn.enable_load_extension(True)
+            import sqlite_vec
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except (ImportError, AttributeError):
+            pytest.skip("sqlite-vec not available")
+
+        migrate_to(conn, SchemaState.SEARCHABLE)
+        result = migrate_to(conn, SchemaState.ENRICHED, vec_dimension=64)
+        assert result == SchemaState.ENRICHED
+
+    def test_migrate_empty_to_enriched(self, conn):
+        """Direct jump from EMPTY to ENRICHED."""
+        try:
+            conn.enable_load_extension(True)
+            import sqlite_vec
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except (ImportError, AttributeError):
+            pytest.skip("sqlite-vec not available")
+
+        result = migrate_to(conn, SchemaState.ENRICHED, vec_dimension=64)
+        assert result == SchemaState.ENRICHED
+
+    def test_migrate_invalid_vec_dimension(self, conn):
+        """Invalid vec_dimension raises SchemaError."""
+        with pytest.raises(SchemaError, match="positive integer"):
+            migrate_to(conn, SchemaState.INDEXED, vec_dimension=-1)
+        with pytest.raises(SchemaError, match="positive integer"):
+            migrate_to(conn, SchemaState.INDEXED, vec_dimension=0)
 
 
 # ---------------------------------------------------------------------------
@@ -280,3 +358,21 @@ class TestBackfill:
             "SELECT COUNT(*) FROM documents WHERE vec_indexed = 0"
         ).fetchone()
         assert row[0] == 0
+
+    def test_backfill_vectors_empty(self, conn):
+        """backfill_vectors on empty table returns 0."""
+        try:
+            conn.enable_load_extension(True)
+            import sqlite_vec
+            sqlite_vec.load(conn)
+        except (ImportError, AttributeError):
+            pytest.skip("sqlite-vec not available")
+        migrate_to(conn, SchemaState.INDEXED, vec_dimension=4)
+        result = backfill_vectors(conn, lambda texts: [[0.0]*4]*len(texts))
+        assert result == 0
+
+    def test_backfill_fts_empty(self, conn):
+        """backfill_fts on empty table returns 0."""
+        migrate_to(conn, SchemaState.SEARCHABLE)
+        result = backfill_fts(conn, lambda text: text.lower())
+        assert result == 0

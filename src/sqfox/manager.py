@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +84,13 @@ class SQFoxManager:
         Returns:
             Running SQFox instance.
         """
+        # Sanitize name to prevent path traversal
+        if not re.match(r"^[a-zA-Z0-9_-]+$", name):
+            raise ValueError(
+                f"Invalid database name: {name!r}. "
+                "Only alphanumeric characters, hyphens, and underscores are allowed."
+            )
+
         with self._db_lock:
             if name in self._databases:
                 return self._databases[name]
@@ -105,8 +114,8 @@ class SQFoxManager:
         return self.get_or_create(name)
 
     def __contains__(self, name: str) -> bool:
-        """Check if a database with this name is already open."""
-        return name in self._databases
+        with self._db_lock:
+            return name in self._databases
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -124,12 +133,13 @@ class SQFoxManager:
     def stop(self, timeout: float = 10.0) -> None:
         """Stop all databases gracefully."""
         with self._db_lock:
-            for name, db in list(self._databases.items()):
-                if db.is_running:
-                    db.stop(timeout=timeout)
-                    logger.info("Stopped database '%s'", name)
+            dbs = list(self._databases.items())
             self._databases.clear()
             self._started = False
+        for name, db in dbs:
+            if db.is_running:
+                db.stop(timeout=timeout)
+                logger.info("Stopped database '%s'", name)
 
     def __enter__(self) -> SQFoxManager:
         self.start()
@@ -137,6 +147,17 @@ class SQFoxManager:
 
     def __exit__(self, *exc_info: Any) -> None:
         self.stop()
+
+    def __del__(self) -> None:
+        if self._started and self._databases:
+            logger.warning(
+                "SQFoxManager was garbage-collected while still running. "
+                "Call stop() explicitly or use the context manager."
+            )
+            try:
+                self.stop(timeout=2.0)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Cross-database operations
@@ -150,36 +171,47 @@ class SQFoxManager:
         limit: int = 10,
         alpha: float | None = None,
     ) -> list[tuple[str, SearchResult]]:
-        """Search across all databases and merge results.
+        """Search across all databases in parallel and merge results.
 
         Returns:
             List of (db_name, SearchResult) tuples, sorted by score descending.
         """
-        all_results: list[tuple[str, SearchResult]] = []
-
         with self._db_lock:
             snapshot = list(self._databases.items())
 
-        for name, db in snapshot:
+        if not snapshot:
+            return []
+
+        def _search_one(name: str, db: SQFox) -> list[tuple[str, SearchResult]]:
             if not db.is_running:
-                continue
+                return []
             # Skip databases without documents table
             try:
                 row = db.fetch_one(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='documents'"
                 )
                 if row is None:
-                    continue
+                    return []
             except Exception:
-                continue
+                return []
             try:
                 results = db.search(
                     query, embed_fn=embed_fn, limit=limit, alpha=alpha,
                 )
-                for r in results:
-                    all_results.append((name, r))
+                return [(name, r) for r in results]
             except Exception as exc:
                 logger.warning("Search failed in '%s': %s", name, exc)
+                return []
+
+        all_results: list[tuple[str, SearchResult]] = []
+
+        with ThreadPoolExecutor(max_workers=min(len(snapshot), 8) or 1) as pool:
+            futures = {
+                pool.submit(_search_one, name, db): name
+                for name, db in snapshot
+            }
+            for future in as_completed(futures):
+                all_results.extend(future.result())
 
         # Sort by score descending, take top `limit`
         all_results.sort(key=lambda x: x[1].score, reverse=True)
@@ -216,13 +248,13 @@ class SQFoxManager:
 
     @property
     def databases(self) -> dict[str, SQFox]:
-        """All open databases {name: SQFox}."""
-        return dict(self._databases)
+        with self._db_lock:
+            return dict(self._databases)
 
     @property
     def names(self) -> list[str]:
-        """Names of all open databases."""
-        return list(self._databases.keys())
+        with self._db_lock:
+            return list(self._databases.keys())
 
     def drop(self, name: str, *, delete_file: bool = False) -> None:
         """Stop and remove a database.
@@ -231,6 +263,13 @@ class SQFoxManager:
             name:        Database name.
             delete_file: If True, also delete the .db file and WAL/SHM files.
         """
+        # Sanitize name to prevent path traversal
+        if not re.match(r"^[a-zA-Z0-9_-]+$", name):
+            raise ValueError(
+                f"Invalid database name: {name!r}. "
+                "Only alphanumeric characters, hyphens, and underscores are allowed."
+            )
+
         with self._db_lock:
             if name not in self._databases:
                 return
@@ -239,6 +278,11 @@ class SQFoxManager:
         db_path = db.path
         if db.is_running:
             db.stop()
+
+        resolved = Path(db_path).resolve()
+        base_resolved = self._base_dir.resolve()
+        if base_resolved not in resolved.parents and resolved != base_resolved:
+            raise ValueError("Database path escaped base directory")
 
         if delete_file:
             for suffix in ("", "-wal", "-shm"):

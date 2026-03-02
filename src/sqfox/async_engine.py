@@ -68,9 +68,17 @@ class AsyncSQFox:
     ``ingest`` simultaneously, only ``max_cpu_workers`` embeddings
     are computed at once.
 
+    .. warning::
+
+        Some local models (raw PyTorch / HuggingFace) are **not**
+        thread-safe.  If your embedding or reranker model does not
+        support concurrent calls from multiple threads, set
+        ``max_cpu_workers=1`` to serialize all CPU-heavy operations.
+
     Args:
         *args:           Forwarded to :class:`SQFox`.
         max_cpu_workers: Max threads for CPU-heavy operations.
+                         Set to 1 if your model is not thread-safe.
         **kwargs:        Forwarded to :class:`SQFox`.
     """
 
@@ -91,7 +99,11 @@ class AsyncSQFox:
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> AsyncSQFox:
-        self._db.start()
+        try:
+            await asyncio.to_thread(self._db.start)
+        except Exception:
+            self._cpu_executor.shutdown(wait=False)
+            raise
         return self
 
     async def __aexit__(self, *exc_info: Any) -> None:
@@ -99,8 +111,20 @@ class AsyncSQFox:
         await asyncio.to_thread(self._cpu_executor.shutdown, True)
 
     def start(self) -> None:
-        """Start the underlying sync engine (non-blocking)."""
-        self._db.start()
+        """Start the underlying sync engine.
+
+        .. warning::
+            This is a **synchronous** convenience method.  In async
+            code, prefer ``async with AsyncSQFox(...)`` which calls
+            ``start()`` via ``asyncio.to_thread``.  Calling this
+            directly from an async context will block the event loop
+            during connection setup.
+        """
+        try:
+            self._db.start()
+        except Exception:
+            self._cpu_executor.shutdown(wait=False)
+            raise
 
     async def stop(self) -> None:
         """Gracefully stop the engine and shut down the CPU pool."""
@@ -124,14 +148,18 @@ class AsyncSQFox:
 
         The queue ``put`` is near-instant.  If ``wait=True``, awaits
         the writer thread's confirmation (commit).  If ``wait=False``,
-        returns immediately (fire-and-forget).
+        returns the underlying :class:`concurrent.futures.Future` so the
+        caller can optionally check it later.
+
+        Note: The queue ``put`` acquires ``_write_lock`` which may briefly
+        block if ``stop()`` is running concurrently.
         """
         sync_future = self._db.write(
             sql, params, priority=priority, wait=False, many=many,
         )
-        if not wait:
-            return None
         assert isinstance(sync_future, Future)
+        if not wait:
+            return sync_future
         return await asyncio.wrap_future(sync_future)
 
     async def execute_on_writer(
@@ -169,16 +197,16 @@ class AsyncSQFox:
         *,
         vec_dimension: int | None = None,
     ) -> SchemaState:
-        """Ensure schema is at the target state (runs on writer)."""
-        sync_future = self._db.execute_on_writer(
-            lambda conn: __import__("sqfox.schema", fromlist=["migrate_to"]).migrate_to(
-                conn, target, vec_dimension=vec_dimension
-            ),
-            priority=Priority.HIGH,
-            wait=False,
+        """Ensure schema is at the target state (runs on writer).
+
+        Delegates to the sync engine's ``ensure_schema`` which
+        updates the schema state cache after migration.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._db.ensure_schema(target, vec_dimension=vec_dimension),
         )
-        assert isinstance(sync_future, Future)
-        return await asyncio.wrap_future(sync_future)
 
     # ------------------------------------------------------------------
     # Heavy operations — dedicated CPU pool
@@ -225,12 +253,13 @@ class AsyncSQFox:
         Routes to CPU pool if ``embed_fn`` or ``reranker_fn`` is
         provided, otherwise uses the fast I/O pool for FTS-only search.
         """
-        kwargs: dict[str, Any] = dict(
-            limit=limit, alpha=alpha,
-            reranker_fn=reranker_fn, rerank_top_n=rerank_top_n,
-        )
+        kwargs: dict[str, Any] = dict(limit=limit, alpha=alpha)
         if embed_fn is not None:
             kwargs["embed_fn"] = embed_fn
+        if reranker_fn is not None:
+            kwargs["reranker_fn"] = reranker_fn
+        if rerank_top_n is not None:
+            kwargs["rerank_top_n"] = rerank_top_n
 
         if embed_fn is not None or reranker_fn is not None:
             # Heavy: embedding / reranking → CPU pool
@@ -254,7 +283,19 @@ class AsyncSQFox:
         pages: int = -1,
         progress: Callable[[int, int, int], None] | None = None,
     ) -> None:
-        """Online backup (I/O pool, does not block CPU work)."""
+        """Online backup (I/O pool, does not block CPU work).
+
+        Note:
+            ``progress`` must be a **synchronous** function (``def``, not
+            ``async def``).  SQLite's backup API calls it from a worker
+            thread; passing a coroutine function will silently produce an
+            unawaited coroutine.
+        """
+        if progress is not None and asyncio.iscoroutinefunction(progress):
+            raise TypeError(
+                "progress must be a synchronous function (def), "
+                "not a coroutine function (async def)"
+            )
         await asyncio.to_thread(
             self._db.backup, target, pages=pages, progress=progress,
         )
@@ -283,5 +324,9 @@ class AsyncSQFox:
         return self._db.diagnostics()
 
     def on_startup(self, hook: Callable[[SQFox], None]) -> Callable[[SQFox], None]:
-        """Register a startup hook (runs synchronously on start)."""
+        """Register a startup hook (runs synchronously on start).
+
+        Note: The hook receives the underlying ``SQFox`` (sync) engine
+        instance, not the ``AsyncSQFox`` wrapper.
+        """
         return self._db.on_startup(hook)

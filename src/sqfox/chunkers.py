@@ -184,7 +184,7 @@ def _split_sentences(text: str) -> list[str]:
     if current.strip():
         sentences.append(current.strip())
 
-    return sentences
+    return [s for s in sentences if s.strip()]
 
 
 # ---------------------------------------------------------------------------

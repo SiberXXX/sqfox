@@ -1,9 +1,5 @@
 """Tests for sqfox chunkers: paragraph, sentence, markdown, recursive."""
 
-from pathlib import Path
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
 import pytest
 
 from sqfox.chunkers import (

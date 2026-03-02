@@ -3,12 +3,8 @@
 import asyncio
 import sqlite3
 import time
-from pathlib import Path
 
 import pytest
-
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from sqfox import AsyncSQFox, EngineClosedError, SchemaState
 
@@ -59,11 +55,12 @@ class TestWrites:
 
     @pytest.mark.asyncio
     async def test_write_fire_and_forget(self, tmp_path):
-        """write(wait=False) returns immediately."""
+        """write(wait=False) returns a Future immediately."""
+        from concurrent.futures import Future
         async with AsyncSQFox(str(tmp_path / "ff.db")) as db:
             await db.write("CREATE TABLE t (val TEXT)", wait=True)
             result = await db.write("INSERT INTO t VALUES ('x')", wait=False)
-            assert result is None
+            assert isinstance(result, Future)
 
             # Give writer time to process
             await asyncio.sleep(0.2)
@@ -84,6 +81,26 @@ class TestWrites:
 
             rows = await db.fetch_all("SELECT val FROM t ORDER BY val")
             assert len(rows) == 10
+
+
+# ---------------------------------------------------------------------------
+# Error propagation
+# ---------------------------------------------------------------------------
+
+class TestErrorPropagation:
+    @pytest.mark.asyncio
+    async def test_write_bad_sql_raises(self, tmp_path):
+        async with AsyncSQFox(str(tmp_path / "err.db")) as db:
+            with pytest.raises(sqlite3.OperationalError):
+                await db.write("INVALID SQL GIBBERISH", wait=True)
+
+    @pytest.mark.asyncio
+    async def test_operations_after_stop_raise(self, tmp_path):
+        db = AsyncSQFox(str(tmp_path / "stopped.db"))
+        db.start()
+        await db.stop()
+        with pytest.raises(EngineClosedError):
+            await db.write("SELECT 1", wait=True)
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +138,11 @@ class TestIngest:
             doc_id = await db.ingest("Hello world")
             assert isinstance(doc_id, int)
             assert doc_id >= 1
+            row = await db.fetch_one(
+                "SELECT content FROM documents WHERE id = ?", (doc_id,),
+            )
+            assert row is not None
+            assert row[0] == "Hello world"
 
     @pytest.mark.asyncio
     async def test_ingest_with_metadata(self, tmp_path):
@@ -140,24 +162,19 @@ class TestIngest:
     async def test_concurrent_ingest_limited(self, tmp_path):
         """CPU pool limits concurrent ingest operations."""
         max_workers = 2
-        active = {"count": 0, "peak": 0}
-        lock = asyncio.Lock()
-
-        original_ingest = None
-
         async with AsyncSQFox(
             str(tmp_path / "conc.db"),
             max_cpu_workers=max_workers,
         ) as db:
-            # We track concurrency by looking at how many ingest calls
-            # are active simultaneously
             tasks = []
             for i in range(6):
                 tasks.append(db.ingest(f"Document {i} about testing"))
-
             results = await asyncio.gather(*tasks)
             assert len(results) == 6
             assert all(isinstance(r, int) for r in results)
+            # Verify all documents were actually ingested
+            count = await db.fetch_one("SELECT COUNT(*) FROM documents")
+            assert count[0] == 6
 
 
 # ---------------------------------------------------------------------------
@@ -168,14 +185,18 @@ class TestSearch:
     @pytest.mark.asyncio
     async def test_fts_search_uses_io_pool(self, tmp_path):
         """FTS-only search should work (routed to I/O pool)."""
+        from sqfox import SearchResult
+
         async with AsyncSQFox(str(tmp_path / "fts.db")) as db:
             await db.ensure_schema(SchemaState.SEARCHABLE)
             await db.ingest("Python database tutorial")
             await asyncio.sleep(0.1)
 
             results = await db.search("python")
-            # May or may not find results depending on FTS state
             assert isinstance(results, list)
+            assert len(results) >= 1, "FTS search should find the ingested document"
+            assert isinstance(results[0], SearchResult)
+            assert "Python" in results[0].text or "python" in results[0].text.lower()
 
     @pytest.mark.asyncio
     async def test_hybrid_search_uses_cpu_pool(self, tmp_path):
@@ -184,6 +205,8 @@ class TestSearch:
             import sqlite_vec
         except ImportError:
             pytest.skip("sqlite-vec not available")
+
+        from sqfox import SearchResult
 
         def mock_embed(texts):
             return [[float(ord(c)) / 200.0 for c in t[:4].ljust(4)]
@@ -195,6 +218,9 @@ class TestSearch:
 
             results = await db.search("database", embed_fn=mock_embed)
             assert isinstance(results, list)
+            assert len(results) >= 1, "Hybrid search should find the ingested document"
+            assert isinstance(results[0], SearchResult)
+            assert results[0].score > 0
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +243,21 @@ class TestBackup:
         assert row[0] == "backup_test"
         conn.close()
 
+    @pytest.mark.asyncio
+    async def test_backup_rejects_async_progress(self, tmp_path):
+        """backup() raises TypeError if progress is an async function."""
+        async with AsyncSQFox(str(tmp_path / "bak2.db")) as db:
+            await db.write("CREATE TABLE t (val TEXT)", wait=True)
+
+            async def async_progress(status, remaining, total):
+                pass  # pragma: no cover
+
+            with pytest.raises(TypeError, match="synchronous"):
+                await db.backup(
+                    str(tmp_path / "bak2_out.db"),
+                    progress=async_progress,
+                )
+
 
 # ---------------------------------------------------------------------------
 # Properties
@@ -229,7 +270,53 @@ class TestProperties:
             assert db.is_running
             assert db.path == str(tmp_path / "props.db")
             assert db.queue_size >= 0
-            assert isinstance(db.diagnostics(), dict)
+            diag = db.diagnostics()
+            assert isinstance(diag, dict)
+            assert "sqfox_version" in diag
+            assert diag["is_running"] is True
+            assert diag["path"] == str(tmp_path / "props.db")
+
+    @pytest.mark.asyncio
+    async def test_vec_available_property(self, tmp_path):
+        """vec_available reflects sqlite-vec status."""
+        async with AsyncSQFox(str(tmp_path / "vec.db")) as db:
+            assert isinstance(db.vec_available, bool)
+
+
+# ---------------------------------------------------------------------------
+# execute_on_writer tests
+# ---------------------------------------------------------------------------
+
+class TestExecuteOnWriter:
+    @pytest.mark.asyncio
+    async def test_execute_on_writer(self, tmp_path):
+        """execute_on_writer runs callable on writer connection."""
+        async with AsyncSQFox(str(tmp_path / "eow.db")) as db:
+            await db.write("CREATE TABLE t (val TEXT)", wait=True)
+            result = await db.execute_on_writer(
+                lambda conn: conn.execute(
+                    "INSERT INTO t VALUES ('from_writer')"
+                ).lastrowid
+            )
+            assert isinstance(result, int)
+            row = await db.fetch_one("SELECT val FROM t")
+            assert row is not None
+            assert row[0] == "from_writer"
+
+
+# ---------------------------------------------------------------------------
+# on_startup hook tests
+# ---------------------------------------------------------------------------
+
+class TestOnStartup:
+    @pytest.mark.asyncio
+    async def test_on_startup_hook(self, tmp_path):
+        """on_startup hook runs during start."""
+        hook_called = []
+        db = AsyncSQFox(str(tmp_path / "hook.db"))
+        db.on_startup(lambda engine: hook_called.append(True))
+        async with db:
+            assert len(hook_called) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""sqfox: Lightweight, thread-safe SQLite wrapper with hybrid search."""
+"""sqfox: Embedded SQLite micro-framework for hybrid search, IoT and RAG."""
 
 from .chunkers import html_to_text, markdown_chunker, paragraph_chunker, recursive_chunker, sentence_chunker
 from .async_engine import AsyncSQFox

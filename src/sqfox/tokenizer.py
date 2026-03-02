@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from typing import Callable
 
 logger = logging.getLogger("sqfox.tokenizer")
@@ -13,11 +14,12 @@ logger = logging.getLogger("sqfox.tokenizer")
 # ---------------------------------------------------------------------------
 
 _WORD_RE = re.compile(r"[\w]+", re.UNICODE)
-_CYRILLIC_RANGE = range(0x0400, 0x0500)
+_CYRILLIC_RANGE = range(0x0400, 0x0530)  # Includes Cyrillic Supplement (U+0500-U+052F)
 _FTS5_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
 
 # Cache for lemmatizer instances (per language)
 _lemmatizer_cache: dict[str, Callable[[str], str]] = {}
+_lemmatizer_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -97,21 +99,24 @@ def _get_lemmatizer(lang: str) -> Callable[[str], str]:
       RU: pymorphy3 -> simplemma -> raw passthrough
       EN: simplemma -> raw passthrough
       *:  simplemma -> raw passthrough
+
+    Thread-safe: uses _lemmatizer_lock to guard cache access.
     """
-    if lang in _lemmatizer_cache:
-        return _lemmatizer_cache[lang]
+    with _lemmatizer_lock:
+        if lang in _lemmatizer_cache:
+            return _lemmatizer_cache[lang]
 
-    lemmatizer: Callable[[str], str]
+        lemmatizer: Callable[[str], str]
 
-    if lang == "ru":
-        lemmatizer = _try_pymorphy3()
-        if lemmatizer is None:
+        if lang == "ru":
+            lemmatizer = _try_pymorphy3()
+            if lemmatizer is None:
+                lemmatizer = _try_simplemma(lang)
+        else:
             lemmatizer = _try_simplemma(lang)
-    else:
-        lemmatizer = _try_simplemma(lang)
 
-    _lemmatizer_cache[lang] = lemmatizer
-    return lemmatizer
+        _lemmatizer_cache[lang] = lemmatizer
+        return lemmatizer
 
 
 def _try_pymorphy3() -> Callable[[str], str] | None:

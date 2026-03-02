@@ -451,3 +451,64 @@ class TestEmbedderProtocol:
 
             results = db.search("database", embed_fn=mock_embed)
             assert len(results) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Reranker end-to-end
+# ---------------------------------------------------------------------------
+
+class TestRerankerEndToEnd:
+    """Reranker integration through SQFox.search()."""
+
+    def test_reranker_changes_order(self, tmp_path):
+        """reranker_fn should re-score and reorder results."""
+        try:
+            import sqlite_vec
+        except ImportError:
+            pytest.skip("sqlite-vec not available")
+
+        with SQFox(str(tmp_path / "rerank.db")) as db:
+            db.ingest("Alpha document about databases", embed_fn=mock_embed, wait=True)
+            db.ingest("Beta document about servers", embed_fn=mock_embed, wait=True)
+            db.ingest("Gamma document about databases and servers", embed_fn=mock_embed, wait=True)
+            time.sleep(0.1)
+
+            def server_reranker(query, texts):
+                return [10.0 if "servers" in t else 1.0 for t in texts]
+
+            results = db.search(
+                "database",
+                embed_fn=mock_embed,
+                reranker_fn=server_reranker,
+                limit=3,
+            )
+            assert len(results) >= 1
+            assert "servers" in results[0].text.lower()
+
+    def test_reranker_with_rerank_top_n(self, tmp_path):
+        """rerank_top_n controls how many candidates the reranker sees."""
+        try:
+            import sqlite_vec
+        except ImportError:
+            pytest.skip("sqlite-vec not available")
+
+        seen = []
+
+        def tracking_reranker(query, texts):
+            seen.append(len(texts))
+            return [1.0] * len(texts)
+
+        with SQFox(str(tmp_path / "topn.db")) as db:
+            for i in range(10):
+                db.ingest(f"Document {i} about testing", embed_fn=mock_embed, wait=True)
+            time.sleep(0.1)
+
+            db.search(
+                "testing",
+                embed_fn=mock_embed,
+                reranker_fn=tracking_reranker,
+                limit=2,
+                rerank_top_n=5,
+            )
+            assert seen
+            assert seen[0] <= 5

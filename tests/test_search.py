@@ -202,3 +202,158 @@ class TestStd:
 
     def test_empty(self):
         assert _std([]) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Reranker in hybrid_search
+# ---------------------------------------------------------------------------
+
+class TestReranker:
+    """Tests for reranker_fn integration in hybrid_search."""
+
+    def _setup_db(self, tmp_path):
+        """Create a DB with documents for search."""
+        import sqlite3
+        from sqfox.schema import migrate_to
+        from sqfox.types import SchemaState
+
+        db_path = str(tmp_path / "rerank.db")
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        migrate_to(conn, SchemaState.SEARCHABLE)
+
+        docs = [
+            ("Python is great for scripting", "python great script"),
+            ("Java is used in enterprise", "java use enterprise"),
+            ("Rust is fast and safe", "rust fast safe"),
+            ("Go is simple and concurrent", "go simple concurrent"),
+            ("Python web frameworks rock", "python web framework rock"),
+        ]
+        for content, lemmatized in docs:
+            cursor = conn.execute(
+                "INSERT INTO documents (content, content_lemmatized) VALUES (?, ?)",
+                (content, lemmatized),
+            )
+            doc_id = cursor.lastrowid
+            conn.execute(
+                "INSERT INTO documents_fts(rowid, content_lemmatized) VALUES (?, ?)",
+                (doc_id, lemmatized),
+            )
+            conn.execute(
+                "UPDATE documents SET fts_indexed = 1 WHERE id = ?",
+                (doc_id,),
+            )
+        conn.commit()
+        return conn
+
+    def test_reranker_reorders_results(self, tmp_path):
+        """Reranker should reorder candidates by its scores."""
+        from sqfox.search import hybrid_search
+
+        conn = self._setup_db(tmp_path)
+
+        def dummy_embed(texts):
+            return [[0.0] * 4 for _ in texts]
+
+        def reverse_reranker(query, texts):
+            return [float(i) for i in range(len(texts))]
+
+        results_no_rerank = hybrid_search(
+            conn, "python", dummy_embed, limit=5,
+        )
+        results_reranked = hybrid_search(
+            conn, "python", dummy_embed, limit=5,
+            reranker_fn=reverse_reranker,
+        )
+
+        if len(results_no_rerank) >= 2 and len(results_reranked) >= 2:
+            no_rerank_ids = [r.doc_id for r in results_no_rerank]
+            reranked_ids = [r.doc_id for r in results_reranked]
+            assert no_rerank_ids != reranked_ids
+
+        conn.close()
+
+    def test_reranker_scores_replace_fusion_scores(self, tmp_path):
+        """Results should have reranker scores, not fusion scores."""
+        from sqfox.search import hybrid_search
+
+        conn = self._setup_db(tmp_path)
+
+        def dummy_embed(texts):
+            return [[0.0] * 4 for _ in texts]
+
+        def fixed_reranker(query, texts):
+            return [99.0 + i for i in range(len(texts))]
+
+        results = hybrid_search(
+            conn, "python", dummy_embed, limit=5,
+            reranker_fn=fixed_reranker,
+        )
+
+        if results:
+            assert all(r.score >= 99.0 for r in results)
+
+        conn.close()
+
+    def test_reranker_failure_falls_back(self, tmp_path):
+        """If reranker raises, fall back to fusion scores."""
+        from sqfox.search import hybrid_search
+
+        conn = self._setup_db(tmp_path)
+
+        def dummy_embed(texts):
+            return [[0.0] * 4 for _ in texts]
+
+        def broken_reranker(query, texts):
+            raise RuntimeError("reranker exploded")
+
+        results = hybrid_search(
+            conn, "python", dummy_embed, limit=5,
+            reranker_fn=broken_reranker,
+        )
+        assert len(results) > 0
+        conn.close()
+
+    def test_reranker_wrong_length_ignored(self, tmp_path):
+        """If reranker returns wrong number of scores, skip reranking."""
+        from sqfox.search import hybrid_search
+
+        conn = self._setup_db(tmp_path)
+
+        def dummy_embed(texts):
+            return [[0.0] * 4 for _ in texts]
+
+        def bad_length_reranker(query, texts):
+            return [1.0]
+
+        results = hybrid_search(
+            conn, "python", dummy_embed, limit=5,
+            reranker_fn=bad_length_reranker,
+        )
+        assert len(results) > 0
+        assert all(r.score <= 1.0 for r in results)
+        conn.close()
+
+    def test_rerank_top_n_controls_pool_size(self, tmp_path):
+        """rerank_top_n limits how many candidates the reranker sees."""
+        from sqfox.search import hybrid_search
+
+        conn = self._setup_db(tmp_path)
+
+        def dummy_embed(texts):
+            return [[0.0] * 4 for _ in texts]
+
+        seen_counts = []
+
+        def counting_reranker(query, texts):
+            seen_counts.append(len(texts))
+            return [1.0] * len(texts)
+
+        hybrid_search(
+            conn, "python", dummy_embed, limit=1,
+            reranker_fn=counting_reranker, rerank_top_n=3,
+        )
+
+        assert seen_counts
+        assert seen_counts[0] <= 3
+        conn.close()

@@ -19,6 +19,7 @@ from .types import (
     EngineClosedError,
     Priority,
     QueueFullError,
+    RerankerFn,
     SchemaState,
     SearchResult,
     SQFoxError,
@@ -652,6 +653,37 @@ class SQFox:
         return info
 
     # ------------------------------------------------------------------
+    # Public API — backup
+    # ------------------------------------------------------------------
+
+    def backup(
+        self,
+        target: str | Path,
+        *,
+        pages: int = -1,
+        progress: Callable[[int, int, int], None] | None = None,
+    ) -> None:
+        """Create a consistent online backup of the database.
+
+        Uses SQLite's built-in backup API — safe to call while the
+        writer thread is active (WAL mode handles concurrency).
+
+        Args:
+            target:   Path for the backup file.
+            pages:    Pages per step (-1 = all at once, the default).
+            progress: Optional callback ``(status, remaining, total)``.
+        """
+        if not self._running.is_set():
+            raise EngineClosedError("Engine is not running, cannot backup")
+
+        dst = sqlite3.connect(str(target))
+        try:
+            conn = self._get_reader_connection()
+            conn.backup(dst, pages=pages, progress=progress)
+        finally:
+            dst.close()
+
+    # ------------------------------------------------------------------
     # High-level API — schema, ingest, search
     # ------------------------------------------------------------------
 
@@ -834,10 +866,14 @@ class SQFox:
         embed_fn: EmbedFn | None = None,
         limit: int = 10,
         alpha: float | None = None,
+        reranker_fn: RerankerFn | None = None,
+        rerank_top_n: int | None = None,
     ) -> list[SearchResult]:
         """Search documents using hybrid FTS5 + vector search.
 
         If embed_fn is None, performs FTS-only search.
+        If reranker_fn is provided, top candidates are re-scored by a
+        cross-encoder before returning the final ``limit`` results.
         """
         from .search import hybrid_search, fts_search
         from .tokenizer import lemmatize_query
@@ -852,6 +888,8 @@ class SQFox:
                 lemmatize_fn=lemmatize_query,
                 limit=limit,
                 alpha=alpha,
+                reranker_fn=reranker_fn,
+                rerank_top_n=rerank_top_n,
             )
         else:
             # FTS-only search

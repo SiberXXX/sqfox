@@ -10,7 +10,7 @@ import struct
 import sqlite3
 from typing import Any, Callable
 
-from .types import EmbedFn, Embedder, SearchResult, embed_for_query
+from .types import EmbedFn, Embedder, RerankerFn, SearchResult, embed_for_query
 
 logger = logging.getLogger("sqfox.search")
 
@@ -258,6 +258,8 @@ def hybrid_search(
     fts_limit: int = 50,
     vec_limit: int = 50,
     min_score: float = 0.0,
+    reranker_fn: RerankerFn | None = None,
+    rerank_top_n: int | None = None,
 ) -> list[SearchResult]:
     """Run hybrid FTS5 + vector search with score fusion.
 
@@ -272,10 +274,20 @@ def hybrid_search(
         fts_limit:     How many FTS candidates to retrieve.
         vec_limit:     How many vec candidates to retrieve.
         min_score:     Minimum fused score threshold.
+        reranker_fn:   Optional cross-encoder reranker.  Called with
+                       (query, candidate_texts) -> scores.
+        rerank_top_n:  How many fusion candidates to pass to the
+                       reranker.  Defaults to ``limit * 5`` if reranker
+                       is provided.
 
     Returns:
         List of SearchResult, sorted by score descending.
     """
+    # If reranking, we need more candidates from the fusion stage
+    fusion_limit = limit
+    if reranker_fn is not None:
+        fusion_limit = rerank_top_n if rerank_top_n is not None else limit * 5
+
     # Step 1: FTS search
     fts_results: list[tuple[int, float]] = []
     if lemmatize_fn is not None:
@@ -301,35 +313,31 @@ def hybrid_search(
         return []
 
     if not fts_results:
-        # Normalize single-source scores to [0,1] for consistent min_score behavior
         norm = _min_max_normalize(vec_results)
         fused = sorted(norm.items(), key=lambda x: x[1], reverse=True)
     elif not vec_results:
         norm = _min_max_normalize(fts_results)
         fused = sorted(norm.items(), key=lambda x: x[1], reverse=True)
     else:
-        # Determine alpha
         effective_alpha = alpha
         if effective_alpha is None:
             effective_alpha = adaptive_alpha(query, fts_results, vec_results)
 
-        # Choose fusion method
         use_rrf = len(fts_results) < 3 or len(vec_results) < 3
         if use_rrf:
             fused = rrf_fallback(fts_results, vec_results, alpha=effective_alpha)
         else:
             fused = score_fusion(fts_results, vec_results, alpha=effective_alpha)
 
-    # Step 4: Filter and limit
+    # Step 4: Filter and limit to fusion_limit (pre-reranking pool)
     fused = [(doc_id, score) for doc_id, score in fused if score >= min_score]
-    fused = fused[:limit]
+    fused = fused[:fusion_limit]
 
     if not fused:
         return []
 
     # Step 5: Hydrate with document data
     doc_ids = [doc_id for doc_id, _ in fused]
-    score_map = {doc_id: score for doc_id, score in fused}
 
     placeholders = ",".join(["?"] * len(doc_ids))
     rows = conn.execute(
@@ -340,7 +348,7 @@ def hybrid_search(
 
     doc_map = {row[0]: row for row in rows}
 
-    results = []
+    candidates = []
     for doc_id, score in fused:
         if doc_id not in doc_map:
             continue
@@ -349,7 +357,7 @@ def hybrid_search(
             meta = json.loads(row[2]) if row[2] else {}
         except (json.JSONDecodeError, TypeError):
             meta = {}
-        results.append(SearchResult(
+        candidates.append(SearchResult(
             doc_id=row[0],
             score=score,
             text=row[1],
@@ -357,4 +365,29 @@ def hybrid_search(
             chunk_id=row[3],
         ))
 
-    return results
+    # Step 6: Rerank if reranker is provided
+    if reranker_fn is not None and candidates:
+        texts = [c.text for c in candidates]
+        try:
+            rerank_scores = reranker_fn(query, texts)
+            if len(rerank_scores) == len(candidates):
+                candidates = [
+                    SearchResult(
+                        doc_id=c.doc_id,
+                        score=rs,
+                        text=c.text,
+                        metadata=c.metadata,
+                        chunk_id=c.chunk_id,
+                    )
+                    for c, rs in zip(candidates, rerank_scores)
+                ]
+                candidates.sort(key=lambda r: r.score, reverse=True)
+            else:
+                logger.warning(
+                    "Reranker returned %d scores for %d candidates, skipping",
+                    len(rerank_scores), len(candidates),
+                )
+        except Exception as exc:
+            logger.warning("Reranker failed, using fusion scores: %s", exc)
+
+    return candidates[:limit]

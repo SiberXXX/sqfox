@@ -396,3 +396,69 @@ class TestErrorCallback:
 
         # At least the bad SQL triggered the callback
         assert any("nonexistent" in s for s in errors)
+
+
+# ---------------------------------------------------------------------------
+# Backup tests
+# ---------------------------------------------------------------------------
+
+class TestBackup:
+    def test_backup_creates_copy(self, db_path, tmp_path):
+        """backup() creates a valid copy of the database."""
+        db = SQFox(db_path)
+        db.start()
+        db.write("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", wait=True)
+        db.write("INSERT INTO t VALUES (1, 'hello')", wait=True)
+        db.write("INSERT INTO t VALUES (2, 'world')", wait=True)
+
+        backup_path = str(tmp_path / "backup.db")
+        db.backup(backup_path)
+        db.stop()
+
+        conn = sqlite3.connect(backup_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT val FROM t ORDER BY id").fetchall()
+        assert [r[0] for r in rows] == ["hello", "world"]
+        conn.close()
+
+    def test_backup_while_writing(self, db_path, tmp_path):
+        """backup() works while the writer thread is active."""
+        db = SQFox(db_path)
+        db.start()
+        db.write("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", wait=True)
+
+        for i in range(100):
+            db.write("INSERT INTO t (val) VALUES (?)", (i,))
+        time.sleep(0.3)
+
+        backup_path = str(tmp_path / "backup.db")
+        db.backup(backup_path)
+        db.stop()
+
+        conn = sqlite3.connect(backup_path)
+        count = conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+        assert count > 0
+        conn.close()
+
+    def test_backup_progress_callback(self, db_path, tmp_path):
+        """backup() calls the progress callback."""
+        db = SQFox(db_path)
+        db.start()
+        db.write("CREATE TABLE t (val TEXT)", wait=True)
+        db.write("INSERT INTO t VALUES ('data')", wait=True)
+
+        calls = []
+        def on_progress(status, remaining, total):
+            calls.append((status, remaining, total))
+
+        backup_path = str(tmp_path / "backup.db")
+        db.backup(backup_path, pages=1, progress=on_progress)
+        db.stop()
+
+        assert len(calls) > 0
+
+    def test_backup_requires_running_engine(self, db_path, tmp_path):
+        """backup() raises EngineClosedError if engine is not running."""
+        db = SQFox(db_path)
+        with pytest.raises(EngineClosedError):
+            db.backup(str(tmp_path / "backup.db"))

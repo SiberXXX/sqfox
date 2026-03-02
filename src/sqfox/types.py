@@ -37,6 +37,17 @@ class EmbedFn(Protocol):
 
 
 @runtime_checkable
+class RerankerFn(Protocol):
+    """Protocol for cross-encoder reranking callables.
+
+    A reranker takes the original query and a list of candidate texts,
+    and returns a relevance score for each text (higher = more relevant).
+    """
+
+    def __call__(self, query: str, texts: list[str]) -> list[float]: ...
+
+
+@runtime_checkable
 class Embedder(Protocol):
     """Protocol for instruction-aware embedding adapters.
 

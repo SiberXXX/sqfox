@@ -49,6 +49,7 @@ dev = [
 
 [project.urls]
 Repository = "https://github.com/SiberXXX/sqfox"
+Changelog = "https://github.com/SiberXXX/sqfox/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sqfox"]

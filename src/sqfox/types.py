@@ -64,6 +64,47 @@ class Embedder(Protocol):
     def embed_query(self, text: str) -> list[float]: ...
 
 
+@runtime_checkable
+class VectorBackend(Protocol):
+    """Protocol for pluggable vector storage and search backends.
+
+    Thread-safety contract:
+      - add/remove/flush/close: called ONLY from the writer thread.
+      - search: may be called from ANY reader thread concurrently.
+      - Implementations must handle reader/writer coordination internally.
+    """
+
+    def initialize(self, db_path: str, ndim: int) -> None:
+        """Open or create the index for the given database and dimension."""
+        ...
+
+    def add(self, keys: list[int], vectors: list[list[float]]) -> None:
+        """Add vectors (upsert semantics). Writer thread only."""
+        ...
+
+    def remove(self, keys: list[int]) -> None:
+        """Remove vectors by key. Missing keys silently ignored."""
+        ...
+
+    def search(
+        self, query: list[float], k: int, **kwargs: Any,
+    ) -> list[tuple[int, float]]:
+        """KNN search. Returns (key, distance) sorted by ascending distance."""
+        ...
+
+    def flush(self) -> None:
+        """Persist in-memory changes to disk."""
+        ...
+
+    def count(self) -> int:
+        """Number of vectors in the index."""
+        ...
+
+    def close(self) -> None:
+        """Release all resources."""
+        ...
+
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -178,6 +219,10 @@ class EngineClosedError(SQFoxError):
 
 class QueueFullError(SQFoxError):
     """Raised when the write queue is full and backpressure kicks in."""
+
+
+class VectorBackendError(SQFoxError):
+    """Raised when a vector backend operation fails."""
 
 
 # ---------------------------------------------------------------------------

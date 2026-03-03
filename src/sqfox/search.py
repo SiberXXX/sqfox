@@ -81,18 +81,26 @@ def vec_search(
     query_embedding: list[float],
     *,
     limit: int = 20,
+    vector_backend=None,
 ) -> list[tuple[int, float]]:
-    """Run vector KNN search using sqlite-vec.
+    """Run vector KNN search.
 
-    Args:
-        conn:            Reader connection (with sqlite-vec loaded).
-        query_embedding: Query vector.
-        limit:           Max results (k).
+    If vector_backend is provided, delegates to it.
+    Otherwise uses sqlite-vec SQL query (legacy path).
 
     Returns:
         List of (doc_id, relevance_score) tuples.
         Scores are converted so higher = better: score = 1 / (1 + distance).
     """
+    if vector_backend is not None:
+        try:
+            raw = vector_backend.search(query_embedding, limit, conn=conn)
+        except Exception as exc:
+            logger.warning("Vector backend search failed: %s", exc)
+            return []
+        return [(key, 1.0 / (1.0 + dist)) for key, dist in raw]
+
+    # Legacy sqlite-vec path
     vec_blob = struct.pack(f"{len(query_embedding)}f", *query_embedding)
     try:
         rows = conn.execute(
@@ -283,6 +291,7 @@ def hybrid_search(
     min_score: float = 0.0,
     reranker_fn: RerankerFn | None = None,
     rerank_top_n: int | None = None,
+    vector_backend=None,
 ) -> list[SearchResult]:
     """Run hybrid FTS5 + vector search with score fusion.
 
@@ -327,7 +336,10 @@ def hybrid_search(
     vec_results: list[tuple[int, float]] = []
     try:
         query_embedding = embed_for_query(embed_fn, query)
-        vec_results = vec_search(conn, query_embedding, limit=vec_limit)
+        vec_results = vec_search(
+            conn, query_embedding, limit=vec_limit,
+            vector_backend=vector_backend,
+        )
     except Exception as exc:
         logger.warning("Vector search failed: %s", exc)
 

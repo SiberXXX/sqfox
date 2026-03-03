@@ -33,7 +33,7 @@ Usage with FastAPI::
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
@@ -132,7 +132,7 @@ class AsyncSQFox:
         await asyncio.to_thread(self._cpu_executor.shutdown, True)
 
     # ------------------------------------------------------------------
-    # Writes — near-instant queue put + optional await
+    # Writes — queue put offloaded to thread to avoid lock contention
     # ------------------------------------------------------------------
 
     async def write(
@@ -146,21 +146,21 @@ class AsyncSQFox:
     ) -> Any:
         """Submit a write to the queue.
 
-        The queue ``put`` is near-instant.  If ``wait=True``, awaits
-        the writer thread's confirmation (commit).  If ``wait=False``,
-        returns the underlying :class:`concurrent.futures.Future` so the
-        caller can optionally check it later.
+        If ``wait=True``, awaits the writer thread's confirmation
+        (commit).  If ``wait=False``, returns an ``asyncio.Future``
+        that the caller can ``await`` later.
 
-        Note: The queue ``put`` acquires ``_write_lock`` which may briefly
-        block if ``stop()`` is running concurrently.
+        The queue ``put`` acquires ``_write_lock`` internally, so
+        it is offloaded to a thread to avoid blocking the event loop.
         """
-        sync_future = self._db.write(
+        sync_future: Future = await asyncio.to_thread(
+            self._db.write,
             sql, params, priority=priority, wait=False, many=many,
         )
-        assert isinstance(sync_future, Future)
+        async_future = asyncio.wrap_future(sync_future)
         if not wait:
-            return sync_future
-        return await asyncio.wrap_future(sync_future)
+            return async_future
+        return await async_future
 
     async def execute_on_writer(
         self,
@@ -168,11 +168,15 @@ class AsyncSQFox:
         *,
         priority: Priority = Priority.HIGH,
     ) -> Any:
-        """Run a callable on the writer connection (awaits result)."""
-        sync_future = self._db.execute_on_writer(
+        """Run a callable on the writer connection (awaits result).
+
+        The queue ``put`` is offloaded to a thread to avoid blocking
+        the event loop on ``_write_lock`` contention.
+        """
+        sync_future: Future = await asyncio.to_thread(
+            self._db.execute_on_writer,
             fn, priority=priority, wait=False,
         )
-        assert isinstance(sync_future, Future)
         return await asyncio.wrap_future(sync_future)
 
     # ------------------------------------------------------------------
@@ -202,10 +206,8 @@ class AsyncSQFox:
         Delegates to the sync engine's ``ensure_schema`` which
         updates the schema state cache after migration.
         """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self._db.ensure_schema(target, vec_dimension=vec_dimension),
+        return await asyncio.to_thread(
+            self._db.ensure_schema, target, vec_dimension=vec_dimension,
         )
 
     # ------------------------------------------------------------------
@@ -319,6 +321,10 @@ class AsyncSQFox:
     @property
     def path(self) -> str:
         return self._db.path
+
+    @property
+    def vector_backend_name(self) -> str | None:
+        return self._db.vector_backend_name
 
     def diagnostics(self) -> dict[str, Any]:
         return self._db.diagnostics()

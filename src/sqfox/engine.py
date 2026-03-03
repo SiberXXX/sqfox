@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import queue
 import sqlite3
+import struct
 import sys
 import threading
 import time
@@ -71,6 +72,7 @@ class SQFox:
         cache_size_kb: int = 64_000,
         busy_timeout_ms: int = 5_000,
         enable_vec: bool = True,
+        vector_backend: str | Any | None = None,
         error_callback: Callable[[str, Exception], None] | None = None,
     ) -> None:
         self._path = str(path)
@@ -85,6 +87,8 @@ class SQFox:
         self._cache_size_kb = cache_size_kb
         self._busy_timeout_ms = busy_timeout_ms
         self._enable_vec = enable_vec
+        self._vector_backend_spec = vector_backend
+        self._vector_backend = None  # resolved in start()
         self._error_callback = error_callback
 
         # Writer state
@@ -252,14 +256,15 @@ class SQFox:
     def _writer_loop(self) -> None:
         """Main loop for the writer thread. Processes WriteRequests from the queue."""
         assert self._writer_conn is not None
+        current_batch: list[WriteRequest] = []
 
         try:
             while not self._stop_event.is_set() or not self._queue.empty():
-                batch: list[WriteRequest] = []
+                current_batch = []
                 deadline = time.monotonic() + (self._batch_time_ms / 1000.0)
 
                 # Drain up to batch_size items, waiting up to batch_time_ms
-                while len(batch) < self._batch_size:
+                while len(current_batch) < self._batch_size:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
@@ -268,26 +273,32 @@ class SQFox:
                         _priority, _seq, request = item
                         if request is _STOP:
                             # Poison pill: process remaining batch, then exit
-                            if batch:
-                                self._execute_batch(batch)
+                            if current_batch:
+                                self._execute_batch(current_batch)
+                                current_batch = []
                             return
                         assert isinstance(request, WriteRequest)
-                        batch.append(request)
+                        current_batch.append(request)
                     except queue.Empty:
                         break
 
-                if batch:
-                    self._execute_batch(batch)
+                if current_batch:
+                    self._execute_batch(current_batch)
+                    current_batch = []
 
         except Exception as exc:
             logger.error("Writer thread crashed: %s", exc, exc_info=True)
             self._stop_event.set()
+            # Fail futures from the batch that was being processed
+            crash_exc = SQFoxError(f"Writer thread crashed: {exc}")
+            for req in current_batch:
+                if req.future is not None and not req.future.done():
+                    req.future.set_exception(crash_exc)
             # Drain remaining items and set exceptions on their futures
             while not self._queue.empty():
                 try:
                     _, _, request = self._queue.get_nowait()
                     if isinstance(request, WriteRequest):
-                        crash_exc = SQFoxError(f"Writer thread crashed: {exc}")
                         self._notify_error(request.sql, crash_exc)
                         if request.future is not None:
                             request.future.set_exception(crash_exc)
@@ -316,6 +327,56 @@ class SQFox:
                 daemon=False,
             )
             self._writer_thread.start()
+
+        # Resolve vector backend
+        if self._vector_backend_spec is not None:
+            from .backends.registry import get_backend
+            self._vector_backend = get_backend(self._vector_backend_spec)
+            if hasattr(self._vector_backend, "set_writer_conn"):
+                self._vector_backend.set_writer_conn(self._writer_conn)
+            # Early-initialize if dimension already known (restart scenario)
+            if not getattr(self._vector_backend, "_initialized", False):
+                from .schema import get_stored_dimension
+                ndim = get_stored_dimension(self._writer_conn)
+                if ndim is not None:
+                    self._vector_backend.initialize(self._path, ndim)
+                    # Crash recovery: verify consistency at startup
+                    if hasattr(self._vector_backend, "verify_consistency"):
+                        count_row = self._writer_conn.execute(
+                            "SELECT COUNT(*) FROM documents "
+                            "WHERE vec_indexed = 1"
+                        ).fetchone()
+                        expected = count_row[0] if count_row else 0
+                        if expected > 0 and not self._vector_backend.verify_consistency(expected):
+                            logger.info(
+                                "HNSW inconsistency at startup: expected "
+                                "%d, rebuilding from BLOBs", expected,
+                            )
+                            _REBUILD_BATCH = 2000
+                            cursor = self._writer_conn.execute(
+                                "SELECT id, embedding FROM documents "
+                                "WHERE vec_indexed = 1 "
+                                "AND embedding IS NOT NULL ORDER BY id"
+                            )
+                            if hasattr(self._vector_backend, "reset"):
+                                self._vector_backend.reset(ndim)
+                            while True:
+                                batch = cursor.fetchmany(_REBUILD_BATCH)
+                                if not batch:
+                                    break
+                                keys = [r[0] for r in batch]
+                                vecs = [
+                                    list(struct.unpack(
+                                        f"{ndim}f", r[1]
+                                    ))
+                                    for r in batch
+                                ]
+                                self._vector_backend.add(keys, vecs)
+                            self._vector_backend.flush()
+                            logger.info(
+                                "HNSW rebuilt at startup: %d vectors",
+                                self._vector_backend.count(),
+                            )
 
         # Run startup hooks outside the lock
         for hook in self._on_startup_hooks:
@@ -355,20 +416,23 @@ class SQFox:
                 self._writer_thread = None
             else:
                 self._writer_thread = None
-                # Safe to close — writer thread has exited
-                if self._writer_conn is not None:
-                    try:
-                        self._writer_conn.close()
-                    except Exception:
-                        pass
-                    self._writer_conn = None
-        else:
-            if self._writer_conn is not None:
-                try:
-                    self._writer_conn.close()
-                except Exception:
-                    pass
-                self._writer_conn = None
+
+        # Close vector backend BEFORE closing writer_conn —
+        # backend.close() may flush dirty state via _writer_conn.
+        if self._vector_backend is not None:
+            try:
+                self._vector_backend.close()
+            except Exception as exc:
+                logger.warning("VectorBackend.close() failed: %s", exc)
+            self._vector_backend = None
+
+        # Now safe to close writer connection
+        if self._writer_conn is not None:
+            try:
+                self._writer_conn.close()
+            except Exception:
+                pass
+            self._writer_conn = None
 
         # Drain any orphaned items (from write() calls that raced with stop())
         while not self._queue.empty():
@@ -655,6 +719,22 @@ class SQFox:
         return self._vec_available
 
     @property
+    def vector_backend_name(self) -> str | None:
+        """Name of the active vector backend, or None."""
+        if self._vector_backend is not None:
+            name = type(self._vector_backend).__name__
+            # Friendly names for known backends
+            _friendly = {
+                "SqliteVecBackend": "sqlite-vec",
+                "SqliteHnswBackend": "hnsw",
+                "USearchBackend": "usearch",
+            }
+            return _friendly.get(name, name)
+        if self._vec_available:
+            return "sqlite-vec"
+        return None
+
+    @property
     def is_running(self) -> bool:
         """Whether the engine is currently active."""
         return self._running.is_set()
@@ -690,6 +770,7 @@ class SQFox:
             "batch_size": self._batch_size,
             "batch_time_ms": self._batch_time_ms,
             "schema_state": self._schema_state_cache.name if self._schema_state_cache is not None else None,
+            "vector_backend": self.vector_backend_name,
         }
 
         # Check optional deps
@@ -764,6 +845,19 @@ class SQFox:
         finally:
             dst.close()
 
+        # Copy external vector index file if present
+        if (
+            self._vector_backend is not None
+            and hasattr(self._vector_backend, "_index_path")
+            and self._vector_backend._index_path
+        ):
+            import shutil
+            src_idx = self._vector_backend._index_path
+            if Path(src_idx).exists():
+                self._vector_backend.flush()
+                dst_idx = str(target) + ".usearch"
+                shutil.copy2(src_idx, dst_idx)
+
     # ------------------------------------------------------------------
     # High-level API — schema, ingest, search
     # ------------------------------------------------------------------
@@ -816,6 +910,7 @@ class SQFox:
         import struct as _struct
         from .schema import (
             detect_state,
+            ensure_embedding_column,
             migrate_to,
             validate_dimension,
         )
@@ -887,18 +982,71 @@ class SQFox:
                 migrate_to(conn, SchemaState.BASE)
                 current = SchemaState.BASE
 
+            # Ensure embedding column exists (upgrade from older schema)
+            ensure_embedding_column(conn)
+
             if vec_blobs is not None and vec_dim is not None:
                 validate_dimension(conn, vec_dim, commit=True)
-                # Check for actual vec0 table, not numeric state,
-                # because SEARCHABLE(3) > INDEXED(2) but vec0 may be absent.
-                tables = {
-                    r[0] for r in conn.execute(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE type IN ('table', 'view')"
-                    ).fetchall()
-                }
-                if "documents_vec" not in tables:
-                    migrate_to(conn, SchemaState.INDEXED, vec_dimension=vec_dim)
+
+                if self._vector_backend is not None:
+                    # SqliteVecBackend still needs the vec0 table
+                    from .backends.sqlite_vec import SqliteVecBackend as _SVB
+                    if isinstance(self._vector_backend, _SVB):
+                        tables = {
+                            r[0] for r in conn.execute(
+                                "SELECT name FROM sqlite_master "
+                                "WHERE type IN ('table', 'view')"
+                            ).fetchall()
+                        }
+                        if "documents_vec" not in tables:
+                            migrate_to(conn, SchemaState.INDEXED, vec_dimension=vec_dim)
+
+                    # External backend — initialize if not yet done
+                    if not getattr(self._vector_backend, "_initialized", False):
+                        self._vector_backend.initialize(self._path, vec_dim)
+                        # Crash recovery: verify consistency
+                        if hasattr(self._vector_backend, "verify_consistency"):
+                            count_row = conn.execute(
+                                "SELECT COUNT(*) FROM documents WHERE vec_indexed = 1"
+                            ).fetchone()
+                            expected = count_row[0] if count_row else 0
+                            if not self._vector_backend.verify_consistency(expected):
+                                # Batched rebuild to avoid OOM on low-RAM devices
+                                _REBUILD_BATCH = 2000
+                                cursor = conn.execute(
+                                    "SELECT id, embedding FROM documents "
+                                    "WHERE vec_indexed = 1 AND embedding IS NOT NULL"
+                                    " ORDER BY id"
+                                )
+                                # Reset backend state before batched insert
+                                if hasattr(self._vector_backend, "reset"):
+                                    self._vector_backend.reset(vec_dim)
+                                elif hasattr(self._vector_backend, "rebuild_from_blobs"):
+                                    self._vector_backend.rebuild_from_blobs(
+                                        [], vec_dim,
+                                    )
+                                while True:
+                                    batch = cursor.fetchmany(_REBUILD_BATCH)
+                                    if not batch:
+                                        break
+                                    keys = [r[0] for r in batch]
+                                    vecs = [
+                                        list(struct.unpack(
+                                            f"{vec_dim}f", r[1]
+                                        ))
+                                        for r in batch
+                                    ]
+                                    self._vector_backend.add(keys, vecs)
+                else:
+                    # Legacy sqlite-vec path — ensure vec0 table
+                    tables = {
+                        r[0] for r in conn.execute(
+                            "SELECT name FROM sqlite_master "
+                            "WHERE type IN ('table', 'view')"
+                        ).fetchall()
+                    }
+                    if "documents_vec" not in tables:
+                        migrate_to(conn, SchemaState.INDEXED, vec_dimension=vec_dim)
 
             # Always re-detect after potential migrations
             self._schema_state_cache = detect_state(conn)
@@ -943,16 +1091,25 @@ class SQFox:
 
                 # Write embeddings
                 if vec_blobs is not None and vec_dim is not None:
+                    # Always store raw blobs in documents (source of truth)
                     for cid, blob in zip(chunk_ids, vec_blobs):
                         conn.execute(
-                            "INSERT OR REPLACE INTO documents_vec(rowid, embedding) "
-                            "VALUES (?, ?)",
-                            (cid, blob),
+                            "UPDATE documents SET embedding = ?, vec_indexed = 1 "
+                            "WHERE id = ?",
+                            (blob, cid),
                         )
-                        conn.execute(
-                            "UPDATE documents SET vec_indexed = 1 WHERE id = ?",
-                            (cid,),
-                        )
+
+                    if self._vector_backend is not None:
+                        # External backend — add to index (in-memory, flushed after commit)
+                        self._vector_backend.add(chunk_ids, embeddings)
+                    else:
+                        # Legacy sqlite-vec path
+                        for cid, blob in zip(chunk_ids, vec_blobs):
+                            conn.execute(
+                                "INSERT OR REPLACE INTO documents_vec(rowid, embedding) "
+                                "VALUES (?, ?)",
+                                (cid, blob),
+                            )
 
                 # FTS sync for SEARCHABLE (no triggers) state
                 current = self._schema_state_cache or SchemaState.EMPTY
@@ -977,6 +1134,21 @@ class SQFox:
             except Exception:
                 conn.rollback()
                 raise
+
+            # Flush external backend to disk after SQLite commit.
+            # If flush fails (e.g. disk full), the graph is still in RAM
+            # and documents are already committed — consistency is restored
+            # on next flush or rebuild at restart.  Do NOT let a flush
+            # failure kill the writer thread.
+            if self._vector_backend is not None and vec_blobs is not None:
+                try:
+                    self._vector_backend.flush()
+                except Exception as exc:
+                    logger.warning(
+                        "Vector backend flush failed (will retry on next "
+                        "ingest or recover at restart): %s", exc
+                    )
+
             return parent_id
 
         return self.execute_on_writer(
@@ -1015,6 +1187,7 @@ class SQFox:
                     alpha=alpha,
                     reranker_fn=reranker_fn,
                     rerank_top_n=rerank_top_n,
+                    vector_backend=self._vector_backend,
                 )
             except (sqlite3.OperationalError, SQFoxError) as exc:
                 logger.warning("Hybrid search failed: %s", exc)

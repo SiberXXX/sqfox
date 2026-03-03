@@ -8,6 +8,10 @@ Usage:
   python demo/run_demo.py combined # combined
   python demo/run_demo.py manager  # manager
   python demo/run_demo.py async    # AsyncSQFox
+
+Standalone demos (no model required):
+  python demo/run_hnsw_xray.py           # HNSW graph inspector
+  python demo/run_crash_recovery.py      # crash & recovery
 """
 
 import asyncio

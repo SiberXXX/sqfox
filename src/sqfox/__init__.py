@@ -2,6 +2,7 @@
 
 from .chunkers import html_to_text, markdown_chunker, paragraph_chunker, recursive_chunker, sentence_chunker
 from .async_engine import AsyncSQFox
+from .backends.hnsw import SqliteHnswBackend
 from .engine import SQFox
 from .manager import SQFoxManager
 from .types import (
@@ -17,6 +18,8 @@ from .types import (
     SchemaState,
     SearchResult,
     SQFoxError,
+    VectorBackend,
+    VectorBackendError,
     WriteRequest,
 )
 
@@ -41,6 +44,9 @@ __all__ = [
     "SchemaState",
     "SearchResult",
     "SQFoxError",
+    "VectorBackend",
+    "VectorBackendError",
+    "SqliteHnswBackend",
     "WriteRequest",
 ]
 

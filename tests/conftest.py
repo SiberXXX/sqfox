@@ -25,3 +25,19 @@ requires_sqlite_vec = pytest.mark.skipif(
     not _has_sqlite_vec(),
     reason="sqlite-vec not available",
 )
+
+
+def _has_usearch() -> bool:
+    """Check if usearch + numpy are available."""
+    try:
+        import usearch.index  # noqa: F401
+        import numpy  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+requires_usearch = pytest.mark.skipif(
+    not _has_usearch(),
+    reason="usearch not available (pip install usearch numpy)",
+)

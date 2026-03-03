@@ -55,12 +55,11 @@ class TestWrites:
 
     @pytest.mark.asyncio
     async def test_write_fire_and_forget(self, tmp_path):
-        """write(wait=False) returns a Future immediately."""
-        from concurrent.futures import Future
+        """write(wait=False) returns an asyncio.Future immediately."""
         async with AsyncSQFox(str(tmp_path / "ff.db")) as db:
             await db.write("CREATE TABLE t (val TEXT)", wait=True)
             result = await db.write("INSERT INTO t VALUES ('x')", wait=False)
-            assert isinstance(result, Future)
+            assert isinstance(result, asyncio.Future)
 
             # Give writer time to process
             await asyncio.sleep(0.2)

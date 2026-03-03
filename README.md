@@ -16,7 +16,7 @@ No server. No Docker. No network. One `.db` file. Runs on anything — Raspberry
 ## Install
 
 ```bash
-# Core only (zero dependencies)
+# Core only (zero dependencies, includes SqliteHnswBackend)
 pip install sqfox
 
 # With hybrid search (English)
@@ -87,6 +87,43 @@ with SQFox("rag.db") as db:
 ```
 
 sqfox detects `embed_documents` / `embed_query` methods and calls the right one automatically. Plain callables work too.
+
+### Pluggable Vector Backends
+
+By default, sqfox uses sqlite-vec (brute-force KNN). For larger datasets, plug in the built-in HNSW backend — pure Python, zero C dependencies, O(log N) search:
+
+```python
+from sqfox import SQFox, SqliteHnswBackend
+
+# Default — sqlite-vec (brute-force, good up to ~50K vectors)
+db = SQFox("app.db")
+
+# HNSW — O(log N), pure Python, graph stored in SQLite as BLOB
+db = SQFox("app.db", vector_backend="hnsw")
+
+# HNSW with custom parameters
+backend = SqliteHnswBackend(M=16, ef_construction=200, ef_search=64)
+db = SQFox("app.db", vector_backend=backend)
+```
+
+The HNSW graph is stored alongside documents in the same `.db` file. SQLite is the source of truth — if the graph is lost or corrupted, it rebuilds automatically from embedding BLOBs on next startup.
+
+**Write your own backend** — implement the `VectorBackend` protocol:
+
+```python
+from sqfox import VectorBackend
+
+class MyBackend:
+    def initialize(self, db_path: str, ndim: int) -> None: ...
+    def add(self, keys: list[int], vectors: list[list[float]]) -> None: ...
+    def remove(self, keys: list[int]) -> None: ...
+    def search(self, query: list[float], k: int) -> list[tuple[int, float]]: ...
+    def flush(self) -> None: ...
+    def count(self) -> int: ...
+    def close(self) -> None: ...
+
+db = SQFox("app.db", vector_backend=MyBackend())
+```
 
 ### Chunking
 
@@ -225,11 +262,18 @@ Writer Thread (single)          Reader Threads (many)
        +--------- SQLite WAL ---------+
                      |
               One .db file
+                     |
+          +----------+----------+
+          |                     |
+     sqlite-vec            HNSW graph
+     (brute KNN)         (BLOB in SQLite)
 ```
 
 - **Writes**: All writes go through a `PriorityQueue` to a single writer thread. Batched into one transaction (`BEGIN IMMEDIATE`). No `database is locked` errors.
 - **Reads**: Each thread gets its own connection via `threading.local()`. Parallel, non-blocking (WAL mode).
-- **Search**: FTS5 (BM25) and sqlite-vec (KNN) run independently. Merged via Relative Score Fusion with adaptive alpha.
+- **Search**: FTS5 (BM25) and vector backend (sqlite-vec or HNSW) run independently. Merged via Relative Score Fusion with adaptive alpha.
+- **Vector backends**: `sqlite-vec` (brute-force, default) or `SqliteHnswBackend` (pure Python HNSW, O(log N), graph serialized as CSR BLOB in SQLite). Custom backends via the `VectorBackend` protocol.
+- **Crash safety**: Embedding BLOBs are always stored in SQLite (source of truth). The HNSW graph is a rebuildable cache — if corrupted, it auto-recovers from BLOBs on startup.
 - **Auto-PRAGMA**: WAL, `synchronous=NORMAL`, `busy_timeout=5000`, `temp_store=MEMORY`, `cache_size=-64000` (64 MB), `mmap_size=256MB`, `foreign_keys=ON`.
 - **Schema**: Evolves automatically — `EMPTY → BASE → INDEXED → SEARCHABLE → ENRICHED`. No manual migrations. Idempotent. Resumable backfill.
 - **Lemmatization**: Mixed RU+EN text handled per-word — pymorphy3 for Cyrillic, simplemma for Latin.
@@ -253,21 +297,21 @@ sqfox is **not a replacement for PostgreSQL**. It is designed for a specific nic
 | Requirement | Use instead |
 |---|---|
 | Multiple processes writing to one DB | PostgreSQL, MySQL |
-| More than ~100K vectors (sqlite-vec is brute-force O(n)) | pgvector, Qdrant, Milvus |
+| More than ~500K vectors | pgvector, Qdrant, Milvus |
 | Multi-server / distributed / HA | PostgreSQL, Elasticsearch, CockroachDB |
 | High-frequency data (>10K points/sec) | InfluxDB, ClickHouse |
 
 ### Known limitations
 
 - **sqlite-vec is pre-v1** — known memory leaks and segfaults on invalid input. Test on your data before production.
-- **Brute-force vector search** — no HNSW/IVF/LSH. Acceptable up to ~50-100K vectors.
+- **SqliteHnswBackend** — pure Python HNSW. Faster than brute-force on 10K+ vectors, but slower than C/Rust implementations (usearch, hnswlib). Acceptable for edge/embedded scenarios.
 - **Lemmatization without context** — pymorphy3 picks the most frequent word form (~79% accuracy). Fine for search, not perfect.
 - **`synchronous=NORMAL`** — last few seconds of commits may be lost on power failure. DB file won't corrupt. Use `synchronous=FULL` manually if you need guaranteed durability.
 - **SD card wear** — batching reduces fsyncs, but plan card replacement for long-running IoT deployments.
 
 ### Sweet spot
 
-Single process, multiple threads. Up to ~50K docs with vectors or ~1M rows without. Local/embedded deployment. Runs fine on dual-core Celerons, old Core 2 Duo laptops, Raspberry Pi — anything with Python 3.10+. Perfect for DIY home automation, boiler controllers, sensor logging, local knowledge bases. If you're thinking "maybe I need PostgreSQL" — you probably do. sqfox is for cases where PostgreSQL is overkill or impossible.
+Single process, multiple threads. Up to ~50K docs with sqlite-vec, ~100K+ with HNSW backend, or ~1M rows without vectors. Local/embedded deployment. Runs fine on dual-core Celerons, old Core 2 Duo laptops, Raspberry Pi — anything with Python 3.10+. Perfect for DIY home automation, boiler controllers, sensor logging, local knowledge bases. If you're thinking "maybe I need PostgreSQL" — you probably do. sqfox is for cases where PostgreSQL is overkill or impossible.
 
 ## Diagnostics
 
@@ -278,13 +322,14 @@ with SQFox("app.db") as db:
 
 ```json
 {
-  "sqfox_version": "0.1.2",
+  "sqfox_version": "0.2.0",
   "python_version": "3.13.7",
   "platform": "Linux-6.1.0-rpi-aarch64",
   "sqlite_version": "3.50.4",
   "path": "app.db",
   "is_running": true,
   "vec_available": true,
+  "vector_backend": "hnsw",
   "queue_size": 0,
   "schema_state": "ENRICHED"
 }
@@ -301,7 +346,26 @@ with SQFox("app.db") as db:
 | Alpine Linux (musl) | **no** — no musllinux wheel, use `python:3.x-slim` |
 | 32-bit / Windows ARM64 | **no** |
 
-If sqlite-vec is unavailable, sqfox falls back to FTS-only search.
+If sqlite-vec is unavailable, sqfox falls back to FTS-only search (or use `SqliteHnswBackend` which has no C dependencies).
+
+## Demos
+
+```bash
+# IoT + RAG (requires sentence-transformers)
+python demo/run_demo.py
+
+# HNSW X-Ray — interactive graph inspector (requires sentence-transformers)
+python demo/run_hnsw_xray.py
+
+# Crash & Recovery — corrupt HNSW graph, auto-rebuild (requires sentence-transformers)
+python demo/run_crash_recovery.py
+
+# Smart home IoT emulation
+python demo/run_smart_home.py
+
+# OBD-II smart mechanic
+python demo/run_smart_mechanic.py
+```
 
 ## Requirements
 
@@ -309,6 +373,7 @@ If sqlite-vec is unavailable, sqfox falls back to FTS-only search.
 - Core: zero dependencies (stdlib only)
 - `[search]`: simplemma, sqlite-vec
 - `[search-ru]`: + pymorphy3
+- `SqliteHnswBackend`: included in core (pure Python, no extra deps)
 
 ## License
 

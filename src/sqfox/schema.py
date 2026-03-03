@@ -158,6 +158,7 @@ def _migrate_to_base(conn: sqlite3.Connection) -> None:
             content_lemmatized TEXT,
             metadata           TEXT    DEFAULT '{}',
             chunk_of           INTEGER REFERENCES documents(id),
+            embedding          BLOB,
             vec_indexed        INTEGER DEFAULT 0,
             fts_indexed        INTEGER DEFAULT 0,
             created_at         TEXT    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -302,6 +303,42 @@ def validate_dimension(
 
     if stored != dimension:
         raise DimensionError(expected=stored, got=dimension)
+
+
+# ---------------------------------------------------------------------------
+# Schema upgrade helpers
+# ---------------------------------------------------------------------------
+
+def ensure_embedding_column(conn: sqlite3.Connection) -> None:
+    """Add embedding BLOB column if not present (upgrade from older schema)."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()
+    }
+    if "embedding" not in columns:
+        conn.execute("ALTER TABLE documents ADD COLUMN embedding BLOB")
+        conn.commit()
+        logger.info("Added 'embedding' column to documents table")
+
+
+def set_vector_backend_meta(conn: sqlite3.Connection, backend_name: str) -> None:
+    """Record the active vector backend in _sqfox_meta."""
+    conn.execute(
+        "INSERT OR REPLACE INTO _sqfox_meta (key, value) VALUES (?, ?)",
+        ("vector_backend", json.dumps(backend_name)),
+    )
+
+
+def get_vector_backend_meta(conn: sqlite3.Connection) -> str | None:
+    """Get the stored vector backend name, or None."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM _sqfox_meta WHERE key = ?", ("vector_backend",),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    return json.loads(row[0])
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqfox"
-version = "0.2.0"
+version = "0.2.1"
 description = "Embedded SQLite micro-framework for hybrid search (FTS5 + vectors), IoT and RAG"
 readme = "README.md"
 license = "MIT"

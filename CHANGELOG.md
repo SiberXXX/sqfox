@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Добавлена ссылка Changelog в PyPI project URLs
+
 ## 0.2.0
 
 ### Added

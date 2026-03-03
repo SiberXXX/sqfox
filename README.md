@@ -11,7 +11,7 @@ No server. No Docker. No network. One `.db` file. Runs on anything — Raspberry
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-**GitHub**: [github.com/SiberXXX/sqfox](https://github.com/SiberXXX/sqfox) | [README на русском](README_RU.md)
+**GitHub**: [github.com/SiberXXX/sqfox](https://github.com/SiberXXX/sqfox) | [README на русском](https://github.com/SiberXXX/sqfox/blob/main/README_RU.md)
 
 ## Install
 

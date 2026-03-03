@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2
+
+- Исправлена ссылка на русский README (404 на PyPI)
+
 ## 0.2.1
 
 - Добавлена ссылка Changelog в PyPI project URLs

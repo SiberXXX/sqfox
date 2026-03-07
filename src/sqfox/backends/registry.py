@@ -8,10 +8,9 @@ if TYPE_CHECKING:
     from ..types import VectorBackend
 
 _ALIASES: dict[str, tuple[str, str]] = {
-    "sqlite-vec": ("sqfox.backends.sqlite_vec", "SqliteVecBackend"),
-    "sqlite_vec": ("sqfox.backends.sqlite_vec", "SqliteVecBackend"),
-    "usearch": ("sqfox.backends.usearch", "USearchBackend"),
+    "flat": ("sqfox.backends.flat", "SqliteFlatBackend"),
     "hnsw": ("sqfox.backends.hnsw", "SqliteHnswBackend"),
+    "usearch": ("sqfox.backends.usearch", "USearchBackend"),
 }
 
 
@@ -19,7 +18,7 @@ def get_backend(spec: str | VectorBackend | None) -> VectorBackend | None:
     """Resolve a backend specification to a VectorBackend instance.
 
     Args:
-        spec: None, a string alias ("sqlite-vec", "usearch", "hnsw"),
+        spec: None, a string alias ("flat", "hnsw", "usearch"),
               or an existing VectorBackend instance.
 
     Returns:
@@ -40,5 +39,13 @@ def get_backend(spec: str | VectorBackend | None) -> VectorBackend | None:
         cls = getattr(module, class_name)
         return cls()
 
-    # Assume it's already a VectorBackend instance
+    # Validate it looks like a VectorBackend (has required methods)
+    required = ("set_writer_conn", "initialize", "search", "add", "remove", "flush", "count", "close")
+    missing = [m for m in required if not hasattr(spec, m)]
+    if missing:
+        raise TypeError(
+            f"vector_backend must be None, a string alias, or a "
+            f"VectorBackend instance — got {type(spec).__name__} "
+            f"(missing: {', '.join(missing)})"
+        )
     return spec

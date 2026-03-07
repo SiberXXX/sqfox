@@ -14,6 +14,7 @@ Usage:
   python demo/run_smart_mechanic.py
 """
 
+import argparse
 import asyncio
 import json
 import os
@@ -286,7 +287,7 @@ EQUIPMENT_MANUAL = [
 # Main demo
 # ---------------------------------------------------------------------------
 
-async def run():
+async def run(backend=None):
     demo_dir = Path(__file__).parent / "data"
     demo_dir.mkdir(exist_ok=True)
 
@@ -305,7 +306,7 @@ async def run():
 
     async with (
         AsyncSQFox(telemetry_path) as telemetry_db,
-        AsyncSQFox(knowledge_path, max_cpu_workers=1) as knowledge_db,
+        AsyncSQFox(knowledge_path, max_cpu_workers=1, vector_backend=backend) as knowledge_db,
     ):
         # --- Load equipment manual ---
         console.print()
@@ -536,12 +537,20 @@ async def run():
 
 
 def main():
+    parser = argparse.ArgumentParser(description="sqfox CNC Mechanic demo")
+    parser.add_argument(
+        "--backend", default=None,
+        help="Vector backend: flat, hnsw, usearch",
+    )
+    args = parser.parse_args()
+
+    backend_label = f"backend: {args.backend}" if args.backend else "backend: default"
     console.print()
     console.print(Panel(
         Align.center(
             "[bold white]sqfox demo: Self-Diagnosing CNC Machine[/]\n"
             "[dim]AsyncSQFox — dual-pool telemetry + auto-RAG[/]\n"
-            "[dim]Qwen3-Embedding-0.6B, 256 dim (MRL)[/]"
+            f"[dim]Qwen3-Embedding-0.6B, 256 dim (MRL), {backend_label}[/]"
         ),
         border_style="bold red",
         box=box.DOUBLE,
@@ -550,7 +559,7 @@ def main():
     console.print()
     get_model()
 
-    asyncio.run(run())
+    asyncio.run(run(backend=args.backend))
 
     console.print()
     console.print(Panel(

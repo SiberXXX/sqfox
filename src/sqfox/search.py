@@ -1,4 +1,4 @@
-"""Hybrid search: FTS5 + sqlite-vec with score fusion."""
+"""Hybrid search: FTS5 + vector backend with score fusion."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import re
-import struct
 import sqlite3
 from typing import Any, Callable
 
@@ -53,6 +52,12 @@ def fts_search(
         safe_query = safe_query.replace(ch, " ")
     # Remove leading hyphens on tokens (FTS5 NOT operator) and standalone dashes
     safe_query = re.sub(r"(?:^|\s)-+", " ", safe_query)
+    # Neutralize FTS5 boolean operators — replace standalone AND/OR/NOT/NEAR
+    # with lowercase equivalents (FTS5 operators are case-sensitive: uppercase only)
+    safe_query = re.sub(r"\bAND\b", "and", safe_query)
+    safe_query = re.sub(r"\bOR\b", "or", safe_query)
+    safe_query = re.sub(r"\bNOT\b", "not", safe_query)
+    safe_query = re.sub(r"\bNEAR\b", "near", safe_query)
     safe_query = safe_query.strip()
     if not safe_query:
         return []
@@ -86,40 +91,29 @@ def vec_search(
     """Run vector KNN search.
 
     If vector_backend is provided, delegates to it.
-    Otherwise uses sqlite-vec SQL query (legacy path).
+    Otherwise returns empty (no vector search without a backend).
 
     Returns:
         List of (doc_id, relevance_score) tuples.
         Scores are converted so higher = better: score = 1 / (1 + distance).
     """
-    if vector_backend is not None:
-        try:
-            raw = vector_backend.search(query_embedding, limit, conn=conn)
-        except Exception as exc:
-            logger.warning("Vector backend search failed: %s", exc)
-            return []
-        return [(key, 1.0 / (1.0 + dist)) for key, dist in raw]
-
-    # Legacy sqlite-vec path
-    vec_blob = struct.pack(f"{len(query_embedding)}f", *query_embedding)
-    try:
-        rows = conn.execute(
-            """
-            SELECT rowid, distance
-            FROM documents_vec
-            WHERE embedding MATCH ? AND k = ?
-            """,
-            (vec_blob, limit),
-        ).fetchall()
-    except sqlite3.OperationalError as exc:
-        logger.warning(
-            "Vector search failed (documents_vec table may not exist "
-            "or dimension mismatch): %s", exc,
-        )
+    if vector_backend is None:
         return []
 
-    # Convert distance to relevance: higher = better
-    return [(row[0], 1.0 / (1.0 + row[1])) for row in rows]
+    try:
+        raw = vector_backend.search(query_embedding, limit, conn=conn)
+    except (TypeError, ValueError):
+        raise  # programming errors — don't swallow
+    except Exception as exc:
+        logger.warning("Vector backend search failed: %s", exc)
+        return []
+    # Filter out NaN/Inf and negative distances from corrupt embeddings —
+    # one bad vector must not poison the entire search pipeline.
+    return [
+        (key, 1.0 / (1.0 + dist))
+        for key, dist in raw
+        if dist is not None and math.isfinite(dist) and dist >= 0.0
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +133,10 @@ def _min_max_normalize(
     spread = max_s - min_s
 
     if spread == 0:
-        # All scores identical — normalize to 1.0
-        return {doc_id: 1.0 for doc_id, _ in results}
+        # All scores identical — use 0.5 (neutral) to avoid inflating
+        # importance when fused with another source.  Ordering is retained
+        # from the original backend.
+        return {doc_id: 0.5 for doc_id, _ in results}
 
     return {
         doc_id: (score - min_s) / spread
@@ -315,6 +311,9 @@ def hybrid_search(
     Returns:
         List of SearchResult, sorted by score descending.
     """
+    if limit < 1:
+        return []
+
     # If reranking, we need more candidates from the fusion stage
     fusion_limit = limit
     if reranker_fn is not None:
@@ -323,7 +322,7 @@ def hybrid_search(
     # Step 1: FTS search
     fts_results: list[tuple[int, float]] = []
     if lemmatize_fn is not None:
-        query_lemmatized = lemmatize_fn(query, None)
+        query_lemmatized = lemmatize_fn(query, None) or query
     else:
         query_lemmatized = query
 
@@ -406,6 +405,11 @@ def hybrid_search(
         try:
             rerank_scores = reranker_fn(query, texts)
             if len(rerank_scores) == len(candidates):
+                # Replace NaN/Inf with -inf so they sort to the bottom
+                safe_scores = [
+                    rs if math.isfinite(rs) else float("-inf")
+                    for rs in rerank_scores
+                ]
                 candidates = [
                     SearchResult(
                         doc_id=c.doc_id,
@@ -414,7 +418,7 @@ def hybrid_search(
                         metadata=c.metadata,
                         chunk_id=c.chunk_id,
                     )
-                    for c, rs in zip(candidates, rerank_scores)
+                    for c, rs in zip(candidates, safe_scores)
                 ]
                 candidates.sort(key=lambda r: r.score, reverse=True)
             else:

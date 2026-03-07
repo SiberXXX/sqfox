@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import struct as _struct
 import threading
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger("sqfox.backends.usearch")
 
@@ -53,10 +55,14 @@ class USearchBackend:
         self._reader_local = threading.local()
         self._generation = 0
         self._generation_lock = threading.Lock()
+        self._writer_lock = threading.Lock()  # protects writer index for memory-mode reads
         self._initialized = False
         self._is_memory = False
 
     # -- lifecycle --
+
+    def set_writer_conn(self, conn: Any) -> None:  # noqa: ARG002
+        """Accept writer connection (unused — USearch manages its own files)."""
 
     def initialize(self, db_path: str, ndim: int) -> None:
         try:
@@ -118,17 +124,30 @@ class USearchBackend:
     # -- write path --
 
     def add(self, keys: list[int], vectors: list[list[float]]) -> None:
-        assert self._writer_index is not None
+        if self._writer_index is None:
+            raise RuntimeError("USearchBackend.add() called before initialize()")
         import numpy as np
-        keys_arr = np.array(keys, dtype=np.int64)
         vecs_arr = np.array(vectors, dtype=np.float32)
-        self._writer_index.add(keys_arr, vecs_arr)
+        # Dimension validation
+        if self._ndim is not None and vecs_arr.ndim == 2 and vecs_arr.shape[1] != self._ndim:
+            raise ValueError(
+                f"Vector dimension mismatch: expected {self._ndim}, "
+                f"got {vecs_arr.shape[1]}"
+            )
+        # NaN/Inf guard
+        if not np.all(np.isfinite(vecs_arr)):
+            raise ValueError("Vectors contain NaN or Inf values")
+        keys_arr = np.array(keys, dtype=np.int64)
+        with self._writer_lock:
+            self._writer_index.add(keys_arr, vecs_arr)
 
     def remove(self, keys: list[int]) -> None:
-        assert self._writer_index is not None
+        if self._writer_index is None:
+            raise RuntimeError("USearchBackend.remove() called before initialize()")
         import numpy as np
         keys_arr = np.array(keys, dtype=np.int64)
-        self._writer_index.remove(keys_arr)
+        with self._writer_lock:
+            self._writer_index.remove(keys_arr)
 
     def flush(self) -> None:
         if self._writer_index is None or self._index_path is None:
@@ -151,9 +170,11 @@ class USearchBackend:
     ) -> list[tuple[int, float]]:
         reader = self._get_reader_index()
         if reader is None:
-            # No mmap reader available — fall back to writer index
-            if self._writer_index is not None and len(self._writer_index) > 0:
-                return self._do_search(self._writer_index, query, k)
+            # No mmap reader available — fall back to writer index.
+            # Lock protects against concurrent add/remove on writer thread.
+            with self._writer_lock:
+                if self._writer_index is not None and len(self._writer_index) > 0:
+                    return self._do_search(self._writer_index, query, k)
             return []
         return self._do_search(reader, query, k)
 
@@ -244,17 +265,26 @@ class USearchBackend:
         logger.info("Rebuilding USearch index from %d blobs", len(rows))
         self.reset(ndim)
 
+        expected_blob_size = ndim * 4
         BATCH = 2000
         for i in range(0, len(rows), BATCH):
-            batch = rows[i : i + BATCH]
-            keys = [r[0] for r in batch]
-            vecs = [
-                list(_struct.unpack(f"{ndim}f", r[1])) for r in batch
-            ]
-            self._writer_index.add(
-                np.array(keys, dtype=np.int64),
-                np.array(vecs, dtype=np.float32),
-            )
+            batch_rows = rows[i : i + BATCH]
+            keys = []
+            vecs = []
+            for r in batch_rows:
+                if len(r[1]) != expected_blob_size:
+                    logger.warning(
+                        "Skipping doc %d: blob size %d != expected %d",
+                        r[0], len(r[1]), expected_blob_size,
+                    )
+                    continue
+                keys.append(r[0])
+                vecs.append(list(_struct.unpack(f"{ndim}f", r[1])))
+            if keys:
+                self._writer_index.add(
+                    np.array(keys, dtype=np.int64),
+                    np.array(vecs, dtype=np.float32),
+                )
 
         if self._index_path:
             self._writer_index.save(self._index_path)

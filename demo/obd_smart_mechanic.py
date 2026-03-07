@@ -559,13 +559,16 @@ async def main():
                         help="Directory for database files")
     parser.add_argument("--interval", type=float, default=0.2,
                         help="Poll interval in seconds")
+    parser.add_argument("--backend", default=None,
+                        help="Vector backend: flat, hnsw, usearch")
     args = parser.parse_args()
 
+    backend_label = f"backend: {args.backend}" if args.backend else "backend: default"
     console.print()
     console.print(Panel(
         Align.center(
             "[bold white]OBD-II Smart Mechanic[/]\n"
-            "[dim]Real-time diagnostics with auto-RAG[/]"
+            f"[dim]Real-time diagnostics with auto-RAG, {backend_label}[/]"
         ),
         border_style="bold red",
         box=box.DOUBLE,
@@ -583,7 +586,7 @@ async def main():
 
     async with (
         AsyncSQFox(telemetry_path) as telemetry_db,
-        AsyncSQFox(knowledge_path, max_cpu_workers=1) as knowledge_db,
+        AsyncSQFox(knowledge_path, max_cpu_workers=1, vector_backend=args.backend) as knowledge_db,
     ):
         with console.status("[bold cyan]Loading service manual...[/]"):
             await load_manual(knowledge_db, args.load_manual)

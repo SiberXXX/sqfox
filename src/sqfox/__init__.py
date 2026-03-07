@@ -1,8 +1,10 @@
 """sqfox: Embedded SQLite micro-framework for hybrid search, IoT and RAG."""
 
+from ._auto import AUTO
 from .chunkers import html_to_text, markdown_chunker, paragraph_chunker, recursive_chunker, sentence_chunker
 from .async_engine import AsyncSQFox
 from .backends.hnsw import SqliteHnswBackend
+from .backends.flat import SqliteFlatBackend
 from .engine import SQFox
 from .manager import SQFoxManager
 from .types import (
@@ -24,6 +26,7 @@ from .types import (
 )
 
 __all__ = [
+    "AUTO",
     "AsyncSQFox",
     "SQFox",
     "SQFoxManager",
@@ -47,7 +50,8 @@ __all__ = [
     "VectorBackend",
     "VectorBackendError",
     "SqliteHnswBackend",
+    "SqliteFlatBackend",
     "WriteRequest",
 ]
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"

@@ -200,18 +200,13 @@ class TestSearch:
     @pytest.mark.asyncio
     async def test_hybrid_search_uses_cpu_pool(self, tmp_path):
         """Search with embed_fn should use CPU pool."""
-        try:
-            import sqlite_vec
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
-
         from sqfox import SearchResult
 
         def mock_embed(texts):
             return [[float(ord(c)) / 200.0 for c in t[:4].ljust(4)]
                     for t in texts]
 
-        async with AsyncSQFox(str(tmp_path / "hyb.db")) as db:
+        async with AsyncSQFox(str(tmp_path / "hyb.db"), vector_backend="hnsw") as db:
             await db.ingest("Database optimization guide", embed_fn=mock_embed)
             await asyncio.sleep(0.1)
 
@@ -276,10 +271,10 @@ class TestProperties:
             assert diag["path"] == str(tmp_path / "props.db")
 
     @pytest.mark.asyncio
-    async def test_vec_available_property(self, tmp_path):
-        """vec_available reflects sqlite-vec status."""
-        async with AsyncSQFox(str(tmp_path / "vec.db")) as db:
-            assert isinstance(db.vec_available, bool)
+    async def test_vector_backend_name_property(self, tmp_path):
+        """vector_backend_name reflects configured backend."""
+        async with AsyncSQFox(str(tmp_path / "vec.db"), vector_backend="hnsw") as db:
+            assert db.vector_backend_name == "hnsw"
 
 
 # ---------------------------------------------------------------------------

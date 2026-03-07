@@ -23,3 +23,6 @@ env/
 .claude/
 demo/data/
 demo/obd_data/
+
+# Internal planning / notes (not for public repo)
+TODO_*.md

@@ -72,7 +72,23 @@ class VectorBackend(Protocol):
       - add/remove/flush/close: called ONLY from the writer thread.
       - search: may be called from ANY reader thread concurrently.
       - Implementations must handle reader/writer coordination internally.
+
+    Lifecycle (called by :class:`SQFox` engine):
+      1. ``set_writer_conn(conn)`` — inject writer connection
+      2. ``initialize(db_path, ndim)`` — load/create index
+      3. ``add`` / ``remove`` / ``search`` — normal operation
+      4. ``flush()`` — persist after commit
+      5. ``close()`` — release resources
+
+    Crash recovery (optional, checked via ``hasattr``):
+      - ``verify_consistency(expected)`` — compare index count with DB
+      - ``reset(ndim)`` — clear in-memory state before rebuild
+      - ``rebuild_from_blobs(rows, ndim)`` — rebuild from embedding BLOBs
     """
+
+    def set_writer_conn(self, conn: Any) -> None:
+        """Inject the writer ``sqlite3.Connection`` before initialize."""
+        ...
 
     def initialize(self, db_path: str, ndim: int) -> None:
         """Open or create the index for the given database and dimension."""
@@ -89,7 +105,12 @@ class VectorBackend(Protocol):
     def search(
         self, query: list[float], k: int, **kwargs: Any,
     ) -> list[tuple[int, float]]:
-        """KNN search. Returns (key, distance) sorted by ascending distance."""
+        """KNN search. Returns ``(key, distance)`` ascending by distance.
+
+        Some backends require ``conn=`` kwarg for vector fetches
+        (SqliteHnswBackend).  SqliteFlatBackend keeps vectors in-memory
+        and ignores it.
+        """
         ...
 
     def flush(self) -> None:
@@ -102,6 +123,20 @@ class VectorBackend(Protocol):
 
     def close(self) -> None:
         """Release all resources."""
+        ...
+
+    def verify_consistency(self, expected_count: int) -> bool:
+        """Check if index count matches expected (from DB). For crash recovery."""
+        ...
+
+    def reset(self, ndim: int | None = None) -> None:
+        """Clear all in-memory state. Optionally update dimension."""
+        ...
+
+    def rebuild_from_blobs(
+        self, rows: list[tuple[int, bytes]], ndim: int,
+    ) -> None:
+        """Rebuild index from ``(doc_id, embedding_blob)`` pairs."""
         ...
 
 
@@ -122,9 +157,9 @@ class SchemaState(enum.IntEnum):
 
     EMPTY      - No sqfox tables exist.
     BASE       - Core documents + _sqfox_meta tables exist.
-    INDEXED    - vec0 virtual table exists for vector search.
+    INDEXED    - Vector dimension registered in meta.
     SEARCHABLE - FTS5 virtual table exists for full-text search.
-    ENRICHED   - Both vec0 and FTS5 exist with sync triggers.
+    ENRICHED   - FTS5 with sync triggers.
     """
 
     EMPTY = 0
@@ -245,18 +280,35 @@ def embed_for_documents(
     - Half-implemented (only one method) → __call__() with warning
     """
     if _is_embedder(embed_fn):
-        return embed_fn.embed_documents(texts)  # type: ignore[union-attr]
-    if hasattr(embed_fn, "embed_documents") and not hasattr(embed_fn, "embed_query"):
+        result = embed_fn.embed_documents(texts)  # type: ignore[union-attr]
+    elif hasattr(embed_fn, "embed_documents") and not hasattr(embed_fn, "embed_query"):
         import logging
         logging.getLogger("sqfox.types").warning(
             "Object has embed_documents() but not embed_query(). "
             "Implement both methods for correct instruction-aware embedding."
         )
-    if not callable(embed_fn):
+        if not callable(embed_fn):
+            raise TypeError(
+                f"embed_fn must be callable or implement Embedder protocol, got {type(embed_fn)}"
+            )
+        result = embed_fn(texts)  # type: ignore[call-arg]
+    elif not callable(embed_fn):
         raise TypeError(
             f"embed_fn must be callable or implement Embedder protocol, got {type(embed_fn)}"
         )
-    return embed_fn(texts)  # type: ignore[call-arg]
+    else:
+        result = embed_fn(texts)  # type: ignore[call-arg]
+    if not result or len(result) != len(texts):
+        raise ValueError(
+            f"embed_fn returned {len(result) if result else 0} vectors "
+            f"for {len(texts)} texts — expected one vector per text"
+        )
+    for i, vec in enumerate(result):
+        if vec is None or not vec:
+            raise ValueError(
+                f"embed_fn returned None or empty vector at index {i}"
+            )
+    return result
 
 
 def embed_for_query(
@@ -270,7 +322,12 @@ def embed_for_query(
     - Half-implemented (only one method) → __call__([text])[0] with warning
     """
     if _is_embedder(embed_fn):
-        return embed_fn.embed_query(text)  # type: ignore[union-attr]
+        vec = embed_fn.embed_query(text)  # type: ignore[union-attr]
+        if vec is None or (hasattr(vec, "__len__") and len(vec) == 0):
+            raise ValueError(
+                "embed_fn.embed_query() returned None or empty vector"
+            )
+        return vec
     if hasattr(embed_fn, "embed_query") and not hasattr(embed_fn, "embed_documents"):
         import logging
         logging.getLogger("sqfox.types").warning(
@@ -281,4 +338,10 @@ def embed_for_query(
         raise TypeError(
             f"embed_fn must be callable or implement Embedder protocol, got {type(embed_fn)}"
         )
-    return embed_fn([text])[0]  # type: ignore[call-arg]
+    result = embed_fn([text])  # type: ignore[call-arg]
+    if not result or result[0] is None or (hasattr(result[0], "__len__") and len(result[0]) == 0):
+        raise ValueError(
+            "embed_fn returned an empty or zero-length vector for query "
+            "embedding — expected a list with at least one non-empty vector"
+        )
+    return result[0]

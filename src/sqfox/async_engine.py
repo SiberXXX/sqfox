@@ -85,30 +85,56 @@ class AsyncSQFox:
     def __init__(
         self,
         *args: Any,
-        max_cpu_workers: int = 2,
+        max_cpu_workers: int | str = "auto",
         **kwargs: Any,
     ) -> None:
         self._db = SQFox(*args, **kwargs)
-        self._cpu_executor = ThreadPoolExecutor(
-            max_workers=max_cpu_workers,
-            thread_name_prefix="sqfox-cpu",
-        )
+        self._max_cpu_workers_raw = max_cpu_workers
+        # Executor is created lazily in _ensure_executor() after start()
+        # resolves the environment.  Explicit int → create immediately.
+        if isinstance(max_cpu_workers, int):
+            if max_cpu_workers < 1:
+                max_cpu_workers = 1
+            self._cpu_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+                max_workers=max_cpu_workers,
+                thread_name_prefix="sqfox-cpu",
+            )
+        else:
+            self._cpu_executor = None  # deferred until start()
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _ensure_executor(self) -> None:
+        """Create CPU executor after env detection resolves workers count."""
+        if self._cpu_executor is not None:
+            return
+        from ._auto import resolve_param
+        workers = resolve_param(
+            self._max_cpu_workers_raw,
+            self._db._env.recommended_cpu_workers if self._db._env else 1,
+        )
+        if not isinstance(workers, int) or workers < 1:
+            workers = 1
+        self._cpu_executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="sqfox-cpu",
+        )
+
     async def __aenter__(self) -> AsyncSQFox:
         try:
             await asyncio.to_thread(self._db.start)
+            self._ensure_executor()
         except Exception:
-            self._cpu_executor.shutdown(wait=False)
+            if self._cpu_executor is not None:
+                self._cpu_executor.shutdown(wait=False)
+                self._cpu_executor = None
             raise
         return self
 
     async def __aexit__(self, *exc_info: Any) -> None:
-        await asyncio.to_thread(self._db.stop)
-        await asyncio.to_thread(self._cpu_executor.shutdown, True)
+        await self._shutdown()
 
     def start(self) -> None:
         """Start the underlying sync engine.
@@ -122,14 +148,35 @@ class AsyncSQFox:
         """
         try:
             self._db.start()
+            self._ensure_executor()
         except Exception:
-            self._cpu_executor.shutdown(wait=False)
+            if self._cpu_executor is not None:
+                self._cpu_executor.shutdown(wait=False)
+                self._cpu_executor = None
             raise
 
     async def stop(self) -> None:
         """Gracefully stop the engine and shut down the CPU pool."""
-        await asyncio.to_thread(self._db.stop)
-        await asyncio.to_thread(self._cpu_executor.shutdown, True)
+        await self._shutdown()
+
+    async def _shutdown(self) -> None:
+        """Stop engine + CPU pool, tolerating a dying event loop."""
+        try:
+            await asyncio.to_thread(self._db.stop)
+        except RuntimeError as exc:
+            if "cannot schedule" in str(exc) or "shutdown" in str(exc) or "no running event loop" in str(exc) or "loop is closed" in str(exc):
+                self._db.stop()
+            else:
+                raise
+        if self._cpu_executor is not None:
+            try:
+                await asyncio.to_thread(self._cpu_executor.shutdown, True)
+            except RuntimeError as exc:
+                if "cannot schedule" in str(exc) or "shutdown" in str(exc) or "no running event loop" in str(exc) or "loop is closed" in str(exc):
+                    self._cpu_executor.shutdown(wait=False)
+                else:
+                    raise
+            self._cpu_executor = None
 
     # ------------------------------------------------------------------
     # Writes — queue put offloaded to thread to avoid lock contention
@@ -285,7 +332,12 @@ class AsyncSQFox:
         pages: int = -1,
         progress: Callable[[int, int, int], None] | None = None,
     ) -> None:
-        """Online backup (I/O pool, does not block CPU work).
+        """Online backup.
+
+        When an external vector index exists (USearch), the backup
+        runs entirely on the writer thread to guarantee a consistent
+        point-in-time snapshot (SQLite + index file).  Otherwise uses
+        the I/O pool.
 
         Note:
             ``progress`` must be a **synchronous** function (``def``, not
@@ -303,12 +355,19 @@ class AsyncSQFox:
         )
 
     # ------------------------------------------------------------------
-    # Properties (sync, non-blocking)
+    # Maintenance — I/O pool
     # ------------------------------------------------------------------
 
-    @property
-    def vec_available(self) -> bool:
-        return self._db.vec_available
+    async def vacuum(self, *, into: str | Path | None = None) -> None:
+        """Reclaim disk space by rebuilding the database file.
+
+        See :meth:`SQFox.vacuum` for details.
+        """
+        await asyncio.to_thread(self._db.vacuum, into=into)
+
+    # ------------------------------------------------------------------
+    # Properties (sync, non-blocking)
+    # ------------------------------------------------------------------
 
     @property
     def is_running(self) -> bool:

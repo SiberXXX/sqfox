@@ -21,7 +21,7 @@ What you expected to happen.
 - OS: [e.g. Ubuntu 22.04, Windows 11, Raspberry Pi OS]
 - Python: [e.g. 3.12]
 - sqfox version: [e.g. 0.2.0]
-- Vector backend: [sqlite-vec / hnsw / none]
+- Vector backend: [flat / hnsw / usearch / none]
 
 **Traceback**
 ```

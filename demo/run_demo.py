@@ -14,6 +14,7 @@ Standalone demos (no model required):
   python demo/run_crash_recovery.py      # crash & recovery
 """
 
+import argparse
 import asyncio
 import os
 import sqlite3
@@ -103,7 +104,7 @@ SENSOR_TYPES = [
 ]
 
 
-def run_iot_mode(db_path: str, n_readings: int = 200, n_threads: int = 6):
+def run_iot_mode(db_path: str, n_readings: int = 200, n_threads: int = 6, backend=None):
     console.print()
     console.rule("[bold red]IoT Sensor Emulation[/]")
     console.print()
@@ -120,7 +121,7 @@ def run_iot_mode(db_path: str, n_readings: int = 200, n_threads: int = 6):
     def on_error(sql, exc):
         errors.append((sql, exc))
 
-    with SQFox(db_path, error_callback=on_error, batch_size=32, batch_time_ms=100) as db:
+    with SQFox(db_path, error_callback=on_error, batch_size=32, batch_time_ms=100, vector_backend=backend) as db:
         db.write("""
             CREATE TABLE IF NOT EXISTS sensor_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -303,7 +304,7 @@ RAG_DOCUMENTS = [
 ]
 
 
-def run_rag_mode(db_path: str):
+def run_rag_mode(db_path: str, backend=None):
     console.print()
     console.rule("[bold blue]RAG Knowledge Base[/]")
     console.print()
@@ -313,7 +314,7 @@ def run_rag_mode(db_path: str):
     def on_error(sql, exc):
         errors.append(str(exc))
 
-    with SQFox(db_path, error_callback=on_error) as db:
+    with SQFox(db_path, error_callback=on_error, vector_backend=backend) as db:
         # Ingest with progress
         with Progress(
             SpinnerColumn(),
@@ -461,7 +462,7 @@ def run_rag_mode(db_path: str):
 # Combined
 # ---------------------------------------------------------------------------
 
-def run_combined_mode(db_path: str):
+def run_combined_mode(db_path: str, backend=None):
     console.print()
     console.rule("[bold magenta]Combined: IoT Writes + RAG Search[/]")
     console.print()
@@ -471,7 +472,7 @@ def run_combined_mode(db_path: str):
     def on_error(sql, exc):
         errors.append(str(exc))
 
-    with SQFox(db_path, error_callback=on_error, batch_size=32) as db:
+    with SQFox(db_path, error_callback=on_error, batch_size=32, vector_backend=backend) as db:
         db.write("""
             CREATE TABLE IF NOT EXISTS sensor_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -567,14 +568,14 @@ def run_combined_mode(db_path: str):
 # Manager
 # ---------------------------------------------------------------------------
 
-def run_manager_mode(base_dir: str):
+def run_manager_mode(base_dir: str, backend=None):
     console.print()
     console.rule("[bold green]Multi-Database Manager[/]")
     console.print()
 
     embedder = QwenEmbedder()
 
-    with SQFoxManager(base_dir) as mgr:
+    with SQFoxManager(base_dir, vector_backend=backend) as mgr:
         # IoT
         console.print("[bold]Setting up databases...[/]")
         iot = mgr["sensors"]
@@ -617,11 +618,11 @@ def run_manager_mode(base_dir: str):
         db_table = Table(title="Databases", box=box.ROUNDED, title_style="bold")
         db_table.add_column("Name", style="bold cyan")
         db_table.add_column("Path")
-        db_table.add_column("Vec", justify="center")
+        db_table.add_column("Backend", justify="center")
         for name in mgr.names:
             d = mgr[name]
-            vec_icon = "[green]yes[/]" if d.vec_available else "[red]no[/]"
-            db_table.add_row(name, str(Path(d.path).name), vec_icon)
+            backend_label = d.vector_backend_name or "[dim]none[/]"
+            db_table.add_row(name, str(Path(d.path).name), backend_label)
         console.print(db_table)
 
         # Cross-search
@@ -654,7 +655,7 @@ def run_manager_mode(base_dir: str):
 # AsyncSQFox
 # ---------------------------------------------------------------------------
 
-def run_async_mode(db_path: str):
+def run_async_mode(db_path: str, backend=None):
     console.print()
     console.rule("[bold yellow]AsyncSQFox[/]")
     console.print()
@@ -662,7 +663,7 @@ def run_async_mode(db_path: str):
     embedder = QwenEmbedder()
 
     async def _run():
-        async with AsyncSQFox(db_path) as db:
+        async with AsyncSQFox(db_path, vector_backend=backend) as db:
 
             # --- Concurrent ingest ---
             console.print("[bold]Concurrent Ingest (asyncio.gather)[/]")
@@ -837,12 +838,10 @@ def show_diagnostics(db: SQFox):
     table.add_row("Python", diag["python_version"])
     table.add_row("Platform", diag["platform"])
     table.add_row("SQLite", diag["sqlite_version"])
-    table.add_row("sqlite-vec", str(diag.get("sqlite_vec_version", "N/A")))
     table.add_row("simplemma", str(diag.get("simplemma_version", "N/A")))
     table.add_row("pymorphy3", str(diag.get("pymorphy3_version", "N/A")))
 
-    vec_status = "[green]loaded[/]" if diag["vec_available"] else "[red]not available[/]"
-    table.add_row("Vector search", vec_status)
+    table.add_row("Vector backend", str(diag.get("vector_backend") or "none (FTS only)"))
 
     console.print(table)
 
@@ -864,13 +863,19 @@ def cleanup(*paths):
 
 
 def main():
-    mode = sys.argv[1] if len(sys.argv) > 1 else "all"
-
-    valid_modes = ("all", "iot", "rag", "combined", "manager", "async")
-    if mode not in valid_modes:
-        console.print(f"[red]Unknown mode: {mode}[/]")
-        console.print(f"Valid modes: {', '.join(valid_modes)}")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="sqfox demo")
+    parser.add_argument(
+        "mode", nargs="?", default="all",
+        choices=["all", "iot", "rag", "combined", "manager", "async"],
+        help="Demo mode to run (default: all)",
+    )
+    parser.add_argument(
+        "--backend", default=None,
+        help="Vector backend: flat, hnsw, usearch",
+    )
+    args = parser.parse_args()
+    mode = args.mode
+    backend = args.backend
 
     demo_dir = Path(__file__).parent / "data"
     demo_dir.mkdir(exist_ok=True)
@@ -882,12 +887,13 @@ def main():
     async_db = str(demo_dir / "async_demo.db")
 
     # Banner
+    backend_label = f"backend: {backend}" if backend else "backend: not set (FTS only)"
     console.print()
     console.print(Panel(
         Align.center(
             "[bold white]sqfox demo[/]\n"
             "[dim]IoT + RAG on Qwen3-Embedding-0.6B[/]\n"
-            "[dim]CPU only, 256 dim (MRL)[/]"
+            f"[dim]CPU only, 256 dim (MRL), {backend_label}[/]"
         ),
         border_style="bold cyan",
         box=box.DOUBLE,
@@ -899,7 +905,7 @@ def main():
 
     # Diagnostics
     console.print()
-    with SQFox(str(demo_dir / "_diag.db")) as _db:
+    with SQFox(str(demo_dir / "_diag.db"), vector_backend=backend) as _db:
         show_diagnostics(_db)
     cleanup(str(demo_dir / "_diag.db"))
 
@@ -908,24 +914,24 @@ def main():
 
     if mode in ("all", "iot"):
         cleanup(iot_db, iot_backup)
-        run_iot_mode(iot_db)
+        run_iot_mode(iot_db, backend=backend)
         cleanup(iot_backup)
 
     if mode in ("all", "rag"):
         cleanup(rag_db)
-        run_rag_mode(rag_db)
+        run_rag_mode(rag_db, backend=backend)
 
     if mode in ("all", "combined"):
         cleanup(combined_db)
-        run_combined_mode(combined_db)
+        run_combined_mode(combined_db, backend=backend)
 
     if mode in ("all", "manager"):
         cleanup(manager_dir)
-        run_manager_mode(manager_dir)
+        run_manager_mode(manager_dir, backend=backend)
 
     if mode in ("all", "async"):
         cleanup(async_db, async_backup)
-        run_async_mode(async_db)
+        run_async_mode(async_db, backend=backend)
         cleanup(async_backup)
 
     # Done

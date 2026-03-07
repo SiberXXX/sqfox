@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import queue
 import sqlite3
@@ -9,7 +10,7 @@ import struct
 import sys
 import threading
 import time
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -17,7 +18,6 @@ from typing import Any, Callable, Iterator
 from .types import (
     ChunkerFn,
     EmbedFn,
-    Embedder,
     EngineClosedError,
     Priority,
     QueueFullError,
@@ -45,6 +45,22 @@ def _get_version() -> str:
 _STOP = object()
 
 
+def _safe_set_result(future: Future, value: Any) -> None:
+    """Set result on a Future, ignoring cancelled futures."""
+    try:
+        future.set_result(value)
+    except InvalidStateError:
+        pass  # Future was cancelled — nothing to do
+
+
+def _safe_set_exception(future: Future, exc: BaseException) -> None:
+    """Set exception on a Future, ignoring cancelled futures."""
+    try:
+        future.set_exception(exc)
+    except InvalidStateError:
+        pass  # Future was cancelled — nothing to do
+
+
 class SQFox:
     """Main sqfox engine: thread-safe SQLite with single writer + multi reader.
 
@@ -69,9 +85,9 @@ class SQFox:
         max_queue_size: int = 10_000,
         batch_size: int = 64,
         batch_time_ms: float = 50.0,
-        cache_size_kb: int = 64_000,
+        cache_size_kb: int | str = "auto",
+        mmap_size_mb: int | str = "auto",
         busy_timeout_ms: int = 5_000,
-        enable_vec: bool = True,
         vector_backend: str | Any | None = None,
         error_callback: Callable[[str, Exception], None] | None = None,
     ) -> None:
@@ -82,11 +98,16 @@ class SQFox:
         else:
             self._shared_mem_uri = None
         self._max_queue_size = max_queue_size
-        self._batch_size = batch_size
+        self._base_batch_size = max(1, batch_size)
+        self._batch_size = max(1, batch_size)
         self._batch_time_ms = batch_time_ms
-        self._cache_size_kb = cache_size_kb
+        # Raw values: may be AUTO sentinel.  Resolved in start().
+        self._cache_size_kb_raw = cache_size_kb
+        self._mmap_size_mb_raw = mmap_size_mb
+        # Resolved values (defaults until start() runs detection)
+        self._cache_size_kb: int = cache_size_kb if isinstance(cache_size_kb, int) else 64_000
+        self._mmap_size_mb: int = mmap_size_mb if isinstance(mmap_size_mb, int) else 256
         self._busy_timeout_ms = busy_timeout_ms
-        self._enable_vec = enable_vec
         self._vector_backend_spec = vector_backend
         self._vector_backend = None  # resolved in start()
         self._error_callback = error_callback
@@ -108,8 +129,6 @@ class SQFox:
         # Lifecycle
         self._running = threading.Event()
         self._stop_event = threading.Event()
-        self._vec_available = False
-
         # Lock to prevent race between write() and stop()
         self._write_lock = threading.Lock()
 
@@ -117,6 +136,13 @@ class SQFox:
         # so no lock needed.  Avoids redundant detect_state() queries
         # to sqlite_master on every ingest.
         self._schema_state_cache: SchemaState | None = None
+        self._atexit_registered: bool = False
+        self._stopped = threading.Event()
+
+        # Auto-adaptive state
+        self._env = None  # EnvironmentInfo, populated in start()
+        self._reader_prune_threshold: int = 10
+        self._ingest_counter: int = 0
 
         # Hooks
         self._on_startup_hooks: list[Callable[[SQFox], None]] = []
@@ -152,41 +178,15 @@ class SQFox:
         conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
         conn.execute("PRAGMA temp_store=MEMORY")
         conn.execute(f"PRAGMA cache_size=-{self._cache_size_kb}")
-        if is_file:
-            conn.execute("PRAGMA mmap_size=268435456")  # 256 MB
+        if is_file and self._mmap_size_mb > 0:
+            try:
+                conn.execute(
+                    f"PRAGMA mmap_size={self._mmap_size_mb * 1_048_576}"
+                )
+            except sqlite3.OperationalError:
+                logger.debug("mmap_size PRAGMA failed, disabling mmap")
+                self._mmap_size_mb = 0
         conn.execute("PRAGMA foreign_keys=ON")
-
-    def _try_load_vec(self, conn: sqlite3.Connection) -> bool:
-        """Attempt to load sqlite-vec extension. Returns True on success."""
-        if not self._enable_vec:
-            return False
-        try:
-            conn.enable_load_extension(True)
-            import sqlite_vec
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-            return True
-        except ImportError:
-            logger.warning(
-                "sqlite-vec not installed. Vector search disabled. "
-                "Install with: pip install sqlite-vec\n"
-                "Supported platforms: Linux x86-64/ARM64, "
-                "macOS Intel/Apple Silicon, Windows x86-64.\n"
-                "Alpine Linux (musl), 32-bit systems, and Windows ARM64 "
-                "are NOT supported."
-            )
-            return False
-        except AttributeError:
-            logger.warning(
-                "sqlite-vec installed but enable_load_extension() not "
-                "available. This Python build does not support SQLite "
-                "extensions. On macOS, use Homebrew Python: "
-                "brew install python"
-            )
-            return False
-        except sqlite3.OperationalError as exc:
-            logger.warning("Failed to load sqlite-vec: %s", exc)
-            return False
 
     def _create_writer_connection(self) -> sqlite3.Connection:
         """Create and configure the writer connection."""
@@ -196,7 +196,6 @@ class SQFox:
             conn = sqlite3.connect(self._path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         self._configure_connection(conn)
-        self._vec_available = self._try_load_vec(conn)
         return conn
 
     def _get_reader_connection(self) -> sqlite3.Connection:
@@ -212,14 +211,15 @@ class SQFox:
             conn = sqlite3.connect(self._shared_mem_uri, uri=True, check_same_thread=False)
         else:
             conn = sqlite3.connect(self._path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        self._configure_connection(conn)
-        if self._shared_mem_uri:
-            conn.execute("PRAGMA read_uncommitted=ON")
-        conn.execute("PRAGMA query_only=ON")
-
-        if self._vec_available:
-            self._try_load_vec(conn)
+        try:
+            conn.row_factory = sqlite3.Row
+            self._configure_connection(conn)
+            if self._shared_mem_uri:
+                conn.execute("PRAGMA read_uncommitted=ON")
+            conn.execute("PRAGMA query_only=ON")
+        except Exception:
+            conn.close()
+            raise
 
         tid = threading.get_ident()
         with self._reader_lock:
@@ -229,9 +229,17 @@ class SQFox:
                 conn.close()
                 raise EngineClosedError("Engine stopped during reader creation")
 
+            # Close old connection if thread ID was reused
+            old_conn = self._reader_connections.get(tid)
+            if old_conn is not None:
+                try:
+                    old_conn.close()
+                except Exception:
+                    pass
             self._reader_connections[tid] = conn
-            # Prune connections from dead threads when count exceeds threshold
-            if len(self._reader_connections) > 50:
+            # Prune connections from dead threads when count exceeds threshold.
+            # Threshold is auto-tuned: LOW=5, MEDIUM=10, HIGH=20.
+            if len(self._reader_connections) > self._reader_prune_threshold:
                 alive_ids = {t.ident for t in threading.enumerate()}
                 dead_ids = [k for k in self._reader_connections if k not in alive_ids]
                 for dead_id in dead_ids:
@@ -255,7 +263,8 @@ class SQFox:
 
     def _writer_loop(self) -> None:
         """Main loop for the writer thread. Processes WriteRequests from the queue."""
-        assert self._writer_conn is not None
+        if self._writer_conn is None:
+            raise SQFoxError("Writer connection is None — engine not started properly")
         current_batch: list[WriteRequest] = []
 
         try:
@@ -277,7 +286,8 @@ class SQFox:
                                 self._execute_batch(current_batch)
                                 current_batch = []
                             return
-                        assert isinstance(request, WriteRequest)
+                        if not isinstance(request, WriteRequest):
+                            raise SQFoxError(f"Unexpected item in queue: {type(request)}")
                         current_batch.append(request)
                     except queue.Empty:
                         break
@@ -286,14 +296,25 @@ class SQFox:
                     self._execute_batch(current_batch)
                     current_batch = []
 
+                    # --- Elastic batch: adapt to queue pressure ---
+                    pending = self._queue.qsize()
+                    if pending > self._batch_size * 2:
+                        # Backlog growing — double batch to gulp faster
+                        self._batch_size = min(
+                            self._base_batch_size * 8, self._batch_size * 2
+                        )
+                    elif pending < self._base_batch_size // 2:
+                        # Queue calm — shrink back for low latency
+                        self._batch_size = self._base_batch_size
+
         except Exception as exc:
             logger.error("Writer thread crashed: %s", exc, exc_info=True)
             self._stop_event.set()
             # Fail futures from the batch that was being processed
             crash_exc = SQFoxError(f"Writer thread crashed: {exc}")
             for req in current_batch:
-                if req.future is not None and not req.future.done():
-                    req.future.set_exception(crash_exc)
+                if req.future is not None:
+                    _safe_set_exception(req.future, crash_exc)
             # Drain remaining items and set exceptions on their futures
             while not self._queue.empty():
                 try:
@@ -301,7 +322,7 @@ class SQFox:
                     if isinstance(request, WriteRequest):
                         self._notify_error(request.sql, crash_exc)
                         if request.future is not None:
-                            request.future.set_exception(crash_exc)
+                            _safe_set_exception(request.future, crash_exc)
                 except queue.Empty:
                     break
         finally:
@@ -319,7 +340,60 @@ class SQFox:
             if self._running.is_set():
                 return  # Already running
 
+            # --- Auto-adaptive detection (runs once) ---
+            from ._auto import detect_environment, resolve_param, AUTO
+
+            if self._env is None:
+                self._env = detect_environment(self._path)
+
+            self._cache_size_kb = resolve_param(
+                self._cache_size_kb_raw, self._env.recommended_cache_size_kb,
+            )
+            self._mmap_size_mb = resolve_param(
+                self._mmap_size_mb_raw, self._env.recommended_mmap_size_mb,
+            )
+            # Clamp invalid explicit values to safe minimums
+            if self._cache_size_kb < 1:
+                self._cache_size_kb = 1
+            if self._mmap_size_mb < 0:
+                self._mmap_size_mb = 0
+            self._reader_prune_threshold = (
+                self._env.recommended_reader_prune_threshold
+            )
+
             self._writer_conn = self._create_writer_connection()
+
+            try:
+                # --- Auto-vacuum for NEW databases ---
+                self._setup_auto_vacuum()
+
+                # Resolve vector backend BEFORE writer thread starts
+                # (avoids concurrent access to _writer_conn)
+                if self._vector_backend_spec is not None:
+                    from .backends.registry import get_backend
+                    self._vector_backend = get_backend(self._vector_backend_spec)
+                    if hasattr(self._vector_backend, "set_writer_conn"):
+                        self._vector_backend.set_writer_conn(self._writer_conn)
+                    # Early-initialize if dimension already known (restart scenario)
+                    if not getattr(self._vector_backend, "_initialized", False):
+                        from .schema import get_stored_dimension
+                        ndim = get_stored_dimension(self._writer_conn)
+                        if ndim is not None:
+                            self._vector_backend.initialize(self._path, ndim)
+                            self._startup_verify_backend(ndim)
+
+                # FTS self-healing check (before writer thread starts)
+                self._startup_fts_check()
+            except Exception:
+                # Clean up writer connection on any pre-thread failure
+                try:
+                    self._writer_conn.close()
+                except Exception:
+                    pass
+                self._writer_conn = None
+                self._vector_backend = None
+                raise
+
             self._running.set()
             self._writer_thread = threading.Thread(
                 target=self._writer_loop,
@@ -328,55 +402,10 @@ class SQFox:
             )
             self._writer_thread.start()
 
-        # Resolve vector backend
-        if self._vector_backend_spec is not None:
-            from .backends.registry import get_backend
-            self._vector_backend = get_backend(self._vector_backend_spec)
-            if hasattr(self._vector_backend, "set_writer_conn"):
-                self._vector_backend.set_writer_conn(self._writer_conn)
-            # Early-initialize if dimension already known (restart scenario)
-            if not getattr(self._vector_backend, "_initialized", False):
-                from .schema import get_stored_dimension
-                ndim = get_stored_dimension(self._writer_conn)
-                if ndim is not None:
-                    self._vector_backend.initialize(self._path, ndim)
-                    # Crash recovery: verify consistency at startup
-                    if hasattr(self._vector_backend, "verify_consistency"):
-                        count_row = self._writer_conn.execute(
-                            "SELECT COUNT(*) FROM documents "
-                            "WHERE vec_indexed = 1"
-                        ).fetchone()
-                        expected = count_row[0] if count_row else 0
-                        if expected > 0 and not self._vector_backend.verify_consistency(expected):
-                            logger.info(
-                                "HNSW inconsistency at startup: expected "
-                                "%d, rebuilding from BLOBs", expected,
-                            )
-                            _REBUILD_BATCH = 2000
-                            cursor = self._writer_conn.execute(
-                                "SELECT id, embedding FROM documents "
-                                "WHERE vec_indexed = 1 "
-                                "AND embedding IS NOT NULL ORDER BY id"
-                            )
-                            if hasattr(self._vector_backend, "reset"):
-                                self._vector_backend.reset(ndim)
-                            while True:
-                                batch = cursor.fetchmany(_REBUILD_BATCH)
-                                if not batch:
-                                    break
-                                keys = [r[0] for r in batch]
-                                vecs = [
-                                    list(struct.unpack(
-                                        f"{ndim}f", r[1]
-                                    ))
-                                    for r in batch
-                                ]
-                                self._vector_backend.add(keys, vecs)
-                            self._vector_backend.flush()
-                            logger.info(
-                                "HNSW rebuilt at startup: %d vectors",
-                                self._vector_backend.count(),
-                            )
+            # Register atexit so process exit triggers graceful shutdown
+            if not self._atexit_registered:
+                atexit.register(self._atexit_stop)
+                self._atexit_registered = True
 
         # Run startup hooks outside the lock
         for hook in self._on_startup_hooks:
@@ -387,8 +416,177 @@ class SQFox:
                 self.stop()
                 raise
 
+    def _setup_auto_vacuum(self) -> None:
+        """Enable incremental auto-vacuum on NEW (empty) databases."""
+        if self._writer_conn is None or self._shared_mem_uri is not None:
+            return  # skip for :memory:
+        try:
+            row = self._writer_conn.execute("PRAGMA auto_vacuum").fetchone()
+            if row and row[0] == 0:  # NONE
+                user_tables = self._writer_conn.execute(
+                    "SELECT count(*) FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchone()
+                if user_tables and user_tables[0] == 0:
+                    self._writer_conn.execute(
+                        "PRAGMA auto_vacuum=INCREMENTAL"
+                    )
+                    self._writer_conn.execute("VACUUM")
+                    logger.info("Auto-vacuum set to INCREMENTAL on new database")
+        except sqlite3.OperationalError as exc:
+            logger.debug("Auto-vacuum setup skipped: %s", exc)
+
+    def _startup_verify_backend(self, ndim: int) -> None:
+        """Verify vector backend consistency at startup, rebuild if needed."""
+        if not hasattr(self._vector_backend, "verify_consistency"):
+            return
+        count_row = self._writer_conn.execute(
+            "SELECT COUNT(*) FROM documents WHERE vec_indexed = 1"
+        ).fetchone()
+        expected = count_row[0] if count_row else 0
+        if expected > 0 and not self._vector_backend.verify_consistency(expected):
+            logger.info(
+                "Vector backend inconsistency: expected %d, rebuilding", expected,
+            )
+            _REBUILD_BATCH = 2000
+            cursor = self._writer_conn.execute(
+                "SELECT id, embedding FROM documents "
+                "WHERE vec_indexed = 1 AND embedding IS NOT NULL ORDER BY id"
+            )
+            if hasattr(self._vector_backend, "reset"):
+                self._vector_backend.reset(ndim)
+            while True:
+                batch = cursor.fetchmany(_REBUILD_BATCH)
+                if not batch:
+                    break
+                keys = [r[0] for r in batch]
+                vecs = [
+                    list(struct.unpack(f"{ndim}f", r[1]))
+                    for r in batch
+                ]
+                self._vector_backend.add(keys, vecs)
+            self._vector_backend.flush()
+            logger.info(
+                "Vector backend rebuilt: %d vectors",
+                self._vector_backend.count(),
+            )
+
+    def _auto_select_backend(self, conn: sqlite3.Connection) -> None:
+        """Auto-select vector backend when user didn't specify one.
+
+        Priority:
+          1. Previously stored choice in _sqfox_meta (restart scenario)
+          2. Platform / memory heuristic:
+             - ANDROID_TERMUX   → flat  (phone RAM shared with OS+LLM, OOM risk)
+             - LOW  (<1 GB RAM) → flat  (less RAM overhead, no graph)
+             - MEDIUM / HIGH    → hnsw  (O(log N), scales to 100K+)
+
+        Falls back to "hnsw" if stored backend is unavailable (e.g. usearch
+        was uninstalled).
+        """
+        from ._auto import MemoryTier, PlatformClass
+        from .backends.registry import get_backend
+        from .schema import get_vector_backend_meta, set_vector_backend_meta
+
+        stored = get_vector_backend_meta(conn)
+        if stored:
+            chosen = stored
+        elif self._env is not None and (
+            self._env.platform_class == PlatformClass.ANDROID_TERMUX
+            or self._env.memory_tier == MemoryTier.LOW
+        ):
+            chosen = "flat"
+        else:
+            chosen = "hnsw"
+
+        # Deduplicate: if chosen is already "hnsw", don't try it twice
+        candidates = list(dict.fromkeys([chosen, "hnsw", "flat"]))
+        for candidate in candidates:
+            try:
+                self._vector_backend = get_backend(candidate)
+                chosen = candidate
+                break
+            except (ValueError, ImportError):
+                logger.warning(
+                    "Backend %r unavailable, trying next", candidate,
+                )
+        else:
+            logger.error("No vector backend available — vector search disabled")
+            self._vector_backend = None
+            return
+
+        if self._vector_backend is not None:
+            if hasattr(self._vector_backend, "set_writer_conn"):
+                self._vector_backend.set_writer_conn(conn)
+            if not stored or stored != chosen:
+                set_vector_backend_meta(conn, chosen)
+                conn.commit()
+                if stored and stored != chosen:
+                    logger.info(
+                        "Stored backend %r unavailable, switched to %r",
+                        stored, chosen,
+                    )
+                else:
+                    logger.info("Auto-selected vector backend: %s", chosen)
+
+    def _startup_fts_check(self) -> None:
+        """Lightweight FTS5 integrity check; auto-rebuild if corrupt."""
+        if self._writer_conn is None:
+            return
+        try:
+            from .schema import detect_state
+            state = detect_state(self._writer_conn)
+            if state < SchemaState.SEARCHABLE:
+                return
+            self._writer_conn.execute(
+                "INSERT INTO documents_fts(documents_fts) "
+                "VALUES('integrity-check')"
+            )
+            # Close the implicit transaction opened by the DML statement
+            # so the writer thread can start fresh with BEGIN IMMEDIATE.
+            self._writer_conn.commit()
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+            # Rollback any implicit transaction from the failed integrity-check
+            try:
+                self._writer_conn.rollback()
+            except Exception:
+                pass
+            logger.warning("FTS5 index may be corrupt: %s — rebuilding", exc)
+            try:
+                self._writer_conn.execute(
+                    "INSERT INTO documents_fts(documents_fts) "
+                    "VALUES('rebuild')"
+                )
+                self._writer_conn.commit()
+                logger.info("FTS5 index rebuilt successfully")
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as rebuild_exc:
+                try:
+                    self._writer_conn.rollback()
+                except Exception:
+                    pass
+                logger.error(
+                    "FTS5 rebuild failed: %s — full-text search may not work",
+                    rebuild_exc,
+                )
+
+    def _atexit_stop(self) -> None:
+        """Called by atexit — stop engine if still running."""
+        if self._running.is_set():
+            try:
+                self.stop(timeout=5.0)
+            except Exception:
+                pass
+
     def stop(self, timeout: float = 10.0) -> None:
         """Gracefully shut down: drain queue, close all connections."""
+        if self._stopped.is_set():
+            return
+        self._stopped.set()  # Atomic; guards concurrent stop() calls
+        # Unregister atexit to avoid double-stop
+        if self._atexit_registered:
+            atexit.unregister(self._atexit_stop)
+            self._atexit_registered = False
+
         with self._write_lock:
             if not self._running.is_set() and self._writer_thread is None:
                 self._stop_event.set()
@@ -405,42 +603,59 @@ class SQFox:
                 logger.warning("Queue full during shutdown, forcing stop")
 
         # Wait for writer thread
+        writer_alive = False
         if self._writer_thread is not None:
             self._writer_thread.join(timeout=timeout)
-            if self._writer_thread.is_alive():
+            writer_alive = self._writer_thread.is_alive()
+            if writer_alive:
                 logger.warning(
                     "Writer thread did not stop within %.1fs, "
                     "deferring connection close", timeout
                 )
-                # Do NOT close connection while writer is still using it
-                self._writer_thread = None
-            else:
-                self._writer_thread = None
+            self._writer_thread = None
 
-        # Close vector backend BEFORE closing writer_conn —
-        # backend.close() may flush dirty state via _writer_conn.
-        if self._vector_backend is not None:
-            try:
-                self._vector_backend.close()
-            except Exception as exc:
-                logger.warning("VectorBackend.close() failed: %s", exc)
-            self._vector_backend = None
+        if not writer_alive:
+            # Only close backend/connection when writer is definitely gone.
+            # Otherwise the writer thread would crash on a closed connection.
 
-        # Now safe to close writer connection
-        if self._writer_conn is not None:
-            try:
-                self._writer_conn.close()
-            except Exception:
-                pass
-            self._writer_conn = None
+            # Close vector backend BEFORE closing writer_conn —
+            # backend.close() may flush dirty state via _writer_conn.
+            if self._vector_backend is not None:
+                try:
+                    self._vector_backend.close()
+                except Exception as exc:
+                    logger.warning("VectorBackend.close() failed: %s", exc)
+                self._vector_backend = None
+
+            # PRAGMA optimize: let SQLite refresh query planner stats
+            # after heavy ingestion.  Cheap (~0-5 ms), only if meaningful.
+            if self._writer_conn is not None and self._ingest_counter > 1000:
+                try:
+                    self._writer_conn.execute("PRAGMA optimize")
+                except Exception:
+                    pass
+
+            # Now safe to close writer connection
+            if self._writer_conn is not None:
+                try:
+                    self._writer_conn.close()
+                except Exception:
+                    pass
+                self._writer_conn = None
+        else:
+            logger.warning(
+                "Writer thread still alive — skipping connection close "
+                "to avoid corruption. Resources will leak."
+            )
 
         # Drain any orphaned items (from write() calls that raced with stop())
         while not self._queue.empty():
             try:
                 _, _, request = self._queue.get_nowait()
                 if isinstance(request, WriteRequest) and request.future is not None:
-                    request.future.set_exception(
-                        EngineClosedError("Engine stopped before request was processed")
+                    _safe_set_exception(
+                        request.future,
+                        EngineClosedError("Engine stopped before request was processed"),
                     )
             except queue.Empty:
                 break
@@ -501,7 +716,7 @@ class SQFox:
         priority: Priority = Priority.NORMAL,
         wait: bool = False,
         many: bool = False,
-    ) -> Future[Any] | None:
+    ) -> Future[Any] | Any:
         """Submit a write request to the writer queue.
 
         Args:
@@ -509,11 +724,12 @@ class SQFox:
             params:   Bind parameters.
             priority: Queue priority.
             wait:     If True, block until the write completes and return
-                      the result.  Raises any exception from the writer.
+                      the result (lastrowid).  Raises any exception from
+                      the writer.
             many:     If True, use executemany.
 
         Returns:
-            Future if wait=False, else the direct result (lastrowid).
+            Future[int] if wait=False, else the direct result (lastrowid).
 
         Raises:
             EngineClosedError: If engine is stopped.
@@ -541,7 +757,12 @@ class SQFox:
                 ) from None
 
         if wait:
-            return future.result()
+            try:
+                return future.result(timeout=300)
+            except TimeoutError:
+                raise SQFoxError(
+                    "Write timed out after 300s — writer thread may be stuck"
+                ) from None
         return future
 
     def execute_on_writer(
@@ -580,12 +801,18 @@ class SQFox:
                 ) from None
 
         if wait:
-            return future.result()
+            try:
+                return future.result(timeout=300)
+            except TimeoutError:
+                raise SQFoxError(
+                    "Writer operation timed out after 300s — writer thread may be stuck"
+                ) from None
         return future
 
     def _execute_batch(self, batch: list[WriteRequest]) -> None:
         """Execute a batch of write requests in a single transaction."""
-        assert self._writer_conn is not None
+        if self._writer_conn is None:
+            raise SQFoxError("Writer connection is None — cannot execute batch")
 
         # Separate callable requests from SQL requests
         fn_requests = [r for r in batch if r.fn is not None]
@@ -601,7 +828,7 @@ class SQFox:
                 if self._writer_conn.in_transaction:
                     self._writer_conn.commit()
                 if req.future is not None:
-                    req.future.set_result(result)
+                    _safe_set_result(req.future, result)
             except Exception as exc:
                 # Rollback any uncommitted work from the callable
                 try:
@@ -610,7 +837,7 @@ class SQFox:
                     pass
                 self._notify_error("<execute_on_writer>", exc)
                 if req.future is not None:
-                    req.future.set_exception(exc)
+                    _safe_set_exception(req.future, exc)
 
         # Execute SQL requests in a batch transaction
         if not sql_requests:
@@ -623,7 +850,7 @@ class SQFox:
             for req in sql_requests:
                 self._notify_error(req.sql, exc)
                 if req.future is not None:
-                    req.future.set_exception(exc)
+                    _safe_set_exception(req.future, exc)
             return
 
         # Collect results — only resolve futures AFTER successful commit
@@ -644,18 +871,18 @@ class SQFox:
                 # Failed request + all remaining get exceptions
                 self._notify_error(req.sql, exc)
                 if req.future is not None:
-                    req.future.set_exception(exc)
+                    _safe_set_exception(req.future, exc)
                 for already_done_req, _ in results:
                     rollback_exc = SQFoxError(
                         f"Batch rolled back due to error in later statement: {exc}"
                     )
                     if already_done_req.future is not None:
-                        already_done_req.future.set_exception(rollback_exc)
+                        _safe_set_exception(already_done_req.future, rollback_exc)
                 for remaining in sql_requests[i + 1:]:
                     abort_exc = SQFoxError(f"Batch aborted due to prior error: {exc}")
                     self._notify_error(remaining.sql, abort_exc)
                     if remaining.future is not None:
-                        remaining.future.set_exception(abort_exc)
+                        _safe_set_exception(remaining.future, abort_exc)
                 return
 
         try:
@@ -668,14 +895,14 @@ class SQFox:
                 pass
             for req in sql_requests:
                 self._notify_error(req.sql, exc)
-                if req.future is not None and not req.future.done():
-                    req.future.set_exception(exc)
+                if req.future is not None:
+                    _safe_set_exception(req.future, exc)
             return
 
         # Commit succeeded — now resolve all futures
         for req, lastrowid in results:
             if req.future is not None:
-                req.future.set_result(lastrowid)
+                _safe_set_result(req.future, lastrowid)
 
     # ------------------------------------------------------------------
     # Public API — reads
@@ -714,24 +941,17 @@ class SQFox:
     # ------------------------------------------------------------------
 
     @property
-    def vec_available(self) -> bool:
-        """Whether sqlite-vec extension was loaded successfully."""
-        return self._vec_available
-
-    @property
     def vector_backend_name(self) -> str | None:
         """Name of the active vector backend, or None."""
         if self._vector_backend is not None:
             name = type(self._vector_backend).__name__
             # Friendly names for known backends
             _friendly = {
-                "SqliteVecBackend": "sqlite-vec",
                 "SqliteHnswBackend": "hnsw",
+                "SqliteFlatBackend": "flat",
                 "USearchBackend": "usearch",
             }
             return _friendly.get(name, name)
-        if self._vec_available:
-            return "sqlite-vec"
         return None
 
     @property
@@ -750,11 +970,7 @@ class SQFox:
         return self._path
 
     def diagnostics(self) -> dict[str, Any]:
-        """Return diagnostic info about the engine and its capabilities.
-
-        Useful for debugging platform-specific issues (e.g., sqlite-vec
-        not loading on Alpine Linux).
-        """
+        """Return diagnostic info about the engine and its capabilities."""
         import platform
         info: dict[str, Any] = {
             "sqfox_version": _get_version(),
@@ -764,22 +980,30 @@ class SQFox:
             "sqlite_version": sqlite3.sqlite_version,
             "path": self._path,
             "is_running": self.is_running,
-            "vec_available": self._vec_available,
             "queue_size": self.queue_size,
             "max_queue_size": self._max_queue_size,
-            "batch_size": self._batch_size,
+            "batch_size": self._base_batch_size,
+            "batch_size_current": self._batch_size,
             "batch_time_ms": self._batch_time_ms,
+            "mmap_size_mb": self._mmap_size_mb,
             "schema_state": self._schema_state_cache.name if self._schema_state_cache is not None else None,
             "vector_backend": self.vector_backend_name,
         }
 
-        # Check optional deps
-        try:
-            import sqlite_vec
-            info["sqlite_vec_version"] = getattr(sqlite_vec, "__version__", "installed")
-        except ImportError:
-            info["sqlite_vec_version"] = None
+        # Auto-adaptive environment info
+        if self._env is not None:
+            info["auto"] = {
+                "total_ram_mb": self._env.total_ram_mb,
+                "memory_tier": self._env.memory_tier.name,
+                "cpu_count": self._env.cpu_count,
+                "platform_class": self._env.platform_class.name,
+                "is_sd_card": self._env.is_sd_card,
+                "fts5_available": self._env.fts5_available,
+                "resolved_cache_size_kb": self._cache_size_kb,
+                "resolved_mmap_size_mb": self._mmap_size_mb,
+            }
 
+        # Check optional deps
         try:
             import simplemma
             info["simplemma_version"] = getattr(simplemma, "__version__", "installed")
@@ -807,8 +1031,15 @@ class SQFox:
     ) -> None:
         """Create a consistent online backup of the database.
 
-        Uses SQLite's built-in backup API — safe to call while the
-        writer thread is active (WAL mode handles concurrency).
+        Uses SQLite's built-in backup API.  When an external vector
+        index file exists (USearch backend), the entire operation runs
+        on the writer thread so that no ingest can slip between the
+        SQLite snapshot and the index file copy.  This guarantees the
+        backup is a consistent point-in-time snapshot.
+
+        For backends without external files (hnsw, flat)
+        or when no backend is configured, the backup uses a reader
+        connection (or writer for :memory:) as before.
 
         Args:
             target:   Path for the backup file.
@@ -829,34 +1060,120 @@ class SQFox:
                     f"Backup target is the same as the source database: {dst_path}"
                 )
 
-        dst = sqlite3.connect(str(target))
-        try:
-            if is_memory:
-                # For in-memory DBs, the reader creates a separate empty DB.
-                # We must use the writer connection which holds the actual data.
+        # Check if the backend has an external index file that needs
+        # atomic copying alongside the SQLite database.
+        has_external_index = (
+            self._vector_backend is not None
+            and hasattr(self._vector_backend, "_index_path")
+            and self._vector_backend._index_path
+        )
+
+        if has_external_index:
+            # Atomic backup: flush + SQLite backup + index copy all on
+            # the writer thread.  No ingest can interleave because the
+            # writer processes requests sequentially.
+            self._backup_atomic(target, pages=pages, progress=progress)
+        elif is_memory:
+            dst = sqlite3.connect(str(target))
+            try:
                 self.execute_on_writer(
                     lambda conn: conn.backup(dst, pages=pages, progress=progress),
                     priority=Priority.HIGH,
                     wait=True,
                 )
-            else:
+            finally:
+                dst.close()
+        else:
+            dst = sqlite3.connect(str(target))
+            try:
                 conn = self._get_reader_connection()
                 conn.backup(dst, pages=pages, progress=progress)
-        finally:
-            dst.close()
+            finally:
+                dst.close()
 
-        # Copy external vector index file if present
-        if (
-            self._vector_backend is not None
-            and hasattr(self._vector_backend, "_index_path")
-            and self._vector_backend._index_path
-        ):
-            import shutil
+    def _backup_atomic(
+        self,
+        target: str | Path,
+        *,
+        pages: int = -1,
+        progress: Callable[[int, int, int], None] | None = None,
+    ) -> None:
+        """Atomic backup: SQLite + external index in one writer op.
+
+        Runs entirely on the writer thread so that the index file is
+        guaranteed to match the SQLite snapshot — no ingest can happen
+        between the two copies.
+        """
+        import shutil
+
+        dst_idx = str(target) + ".usearch"
+
+        def _do_backup(conn: sqlite3.Connection) -> None:
+            # 1. Flush pending in-memory vectors to the index file
+            self._vector_backend.flush()
+
+            # 2. Copy the index file FIRST (while writer is quiesced)
+            idx_copied = False
             src_idx = self._vector_backend._index_path
             if Path(src_idx).exists():
-                self._vector_backend.flush()
-                dst_idx = str(target) + ".usearch"
                 shutil.copy2(src_idx, dst_idx)
+                idx_copied = True
+
+            # 3. SQLite backup from the writer connection itself —
+            #    this sees exactly the same committed state as the
+            #    index file we just copied.
+            dst = sqlite3.connect(str(target))
+            try:
+                conn.backup(dst, pages=pages, progress=progress)
+            except Exception:
+                # SQLite backup failed — clean up the already-copied
+                # index file to avoid leaving an orphaned partial backup.
+                if idx_copied:
+                    try:
+                        Path(dst_idx).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                raise
+            finally:
+                dst.close()
+
+        self.execute_on_writer(
+            _do_backup, priority=Priority.HIGH, wait=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Public API — maintenance
+    # ------------------------------------------------------------------
+
+    def vacuum(self, *, into: str | Path | None = None) -> None:
+        """Reclaim disk space by rebuilding the database file.
+
+        On long-running IoT deployments, frequent DELETEs leave empty
+        pages inside the ``.db`` file.  ``vacuum()`` rewrites the file
+        to remove them.
+
+        Args:
+            into: If provided, writes the compacted copy to a new file
+                  (``VACUUM INTO``).  The original file is unchanged.
+                  Requires SQLite 3.27+.
+
+        Note:
+            VACUUM on the main database needs roughly 2× the current
+            file size in free disk space.  ``vacuum(into=...)`` avoids
+            this by writing to a separate file.
+        """
+        if into is not None:
+            self.execute_on_writer(
+                lambda conn: conn.execute("VACUUM INTO ?", (str(into),)),
+                priority=Priority.HIGH,
+                wait=True,
+            )
+        else:
+            self.execute_on_writer(
+                lambda conn: conn.execute("VACUUM"),
+                priority=Priority.HIGH,
+                wait=True,
+            )
 
     # ------------------------------------------------------------------
     # High-level API — schema, ingest, search
@@ -872,12 +1189,27 @@ class SQFox:
 
         Runs on the writer connection.  Blocks until complete.
         Invalidates and refreshes the schema state cache.
+
+        If FTS5 is unavailable and target requires it (SEARCHABLE or
+        ENRICHED), the migration proceeds as far as possible and logs a
+        warning instead of crashing.
         """
         from .schema import migrate_to, detect_state
 
         def _do_migrate(conn: sqlite3.Connection) -> SchemaState:
-            result = migrate_to(conn, target, vec_dimension=vec_dimension)
-            # Refresh cache after explicit migration
+            effective = target
+            if effective >= SchemaState.SEARCHABLE:
+                fts5_ok = (
+                    self._env.fts5_available if self._env is not None
+                    else True
+                )
+                if not fts5_ok:
+                    logger.info(
+                        "FTS5 not available — skipping SEARCHABLE/ENRICHED "
+                        "migration, vector-only search active"
+                    )
+                    effective = SchemaState.INDEXED if vec_dimension else SchemaState.BASE
+            result = migrate_to(conn, effective, vec_dimension=vec_dimension)
             self._schema_state_cache = detect_state(conn)
             return result
 
@@ -915,6 +1247,12 @@ class SQFox:
             validate_dimension,
         )
         from .tokenizer import lemmatize
+
+        # Reject content that would pollute indexes
+        if not content or not content.strip() or "\x00" in content:
+            raise SQFoxError(
+                "content must be a non-empty string without NUL bytes"
+            )
 
         if metadata:
             try:
@@ -988,20 +1326,12 @@ class SQFox:
             if vec_blobs is not None and vec_dim is not None:
                 validate_dimension(conn, vec_dim, commit=True)
 
-                if self._vector_backend is not None:
-                    # SqliteVecBackend still needs the vec0 table
-                    from .backends.sqlite_vec import SqliteVecBackend as _SVB
-                    if isinstance(self._vector_backend, _SVB):
-                        tables = {
-                            r[0] for r in conn.execute(
-                                "SELECT name FROM sqlite_master "
-                                "WHERE type IN ('table', 'view')"
-                            ).fetchall()
-                        }
-                        if "documents_vec" not in tables:
-                            migrate_to(conn, SchemaState.INDEXED, vec_dimension=vec_dim)
+                # --- Auto-backend selection ---
+                if self._vector_backend is None:
+                    self._auto_select_backend(conn)
 
-                    # External backend — initialize if not yet done
+                if self._vector_backend is not None:
+                    # Initialize backend if not yet done
                     if not getattr(self._vector_backend, "_initialized", False):
                         self._vector_backend.initialize(self._path, vec_dim)
                         # Crash recovery: verify consistency
@@ -1031,22 +1361,18 @@ class SQFox:
                                         break
                                     keys = [r[0] for r in batch]
                                     vecs = [
-                                        list(struct.unpack(
+                                        list(_struct.unpack(
                                             f"{vec_dim}f", r[1]
                                         ))
                                         for r in batch
                                     ]
                                     self._vector_backend.add(keys, vecs)
-                else:
-                    # Legacy sqlite-vec path — ensure vec0 table
-                    tables = {
-                        r[0] for r in conn.execute(
-                            "SELECT name FROM sqlite_master "
-                            "WHERE type IN ('table', 'view')"
-                        ).fetchall()
-                    }
-                    if "documents_vec" not in tables:
-                        migrate_to(conn, SchemaState.INDEXED, vec_dimension=vec_dim)
+                                self._vector_backend.flush()
+                                logger.info(
+                                    "Vector backend rebuilt during ingest: "
+                                    "%d vectors",
+                                    self._vector_backend.count(),
+                                )
 
             # Always re-detect after potential migrations
             self._schema_state_cache = detect_state(conn)
@@ -1064,7 +1390,8 @@ class SQFox:
                     (content, meta_str),
                 )
                 parent_id = cursor.lastrowid
-                assert parent_id is not None
+                if parent_id is None:
+                    raise SQFoxError("INSERT returned None lastrowid — unexpected")
 
                 # Insert chunks
                 chunk_ids: list[int] = []
@@ -1076,7 +1403,8 @@ class SQFox:
                             (chunk_text, meta_str, parent_id),
                         )
                         chunk_id = cur.lastrowid
-                        assert chunk_id is not None
+                        if chunk_id is None:
+                            raise SQFoxError("INSERT chunk returned None lastrowid — unexpected")
                         chunk_ids.append(chunk_id)
                     else:
                         chunk_ids.append(parent_id)
@@ -1100,16 +1428,7 @@ class SQFox:
                         )
 
                     if self._vector_backend is not None:
-                        # External backend — add to index (in-memory, flushed after commit)
                         self._vector_backend.add(chunk_ids, embeddings)
-                    else:
-                        # Legacy sqlite-vec path
-                        for cid, blob in zip(chunk_ids, vec_blobs):
-                            conn.execute(
-                                "INSERT OR REPLACE INTO documents_vec(rowid, embedding) "
-                                "VALUES (?, ?)",
-                                (cid, blob),
-                            )
 
                 # FTS sync for SEARCHABLE (no triggers) state
                 current = self._schema_state_cache or SchemaState.EMPTY
@@ -1148,6 +1467,15 @@ class SQFox:
                         "Vector backend flush failed (will retry on next "
                         "ingest or recover at restart): %s", exc
                     )
+
+            # Incremental vacuum: reclaim ~100 pages every 100 ingests.
+            # Takes <1ms, no effect if auto_vacuum is not INCREMENTAL.
+            self._ingest_counter += 1
+            if self._ingest_counter % 100 == 0:
+                try:
+                    conn.execute("PRAGMA incremental_vacuum(100)")
+                except sqlite3.OperationalError:
+                    pass
 
             return parent_id
 

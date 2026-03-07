@@ -42,7 +42,6 @@ def detect_state(conn: sqlite3.Connection) -> SchemaState:
 
     has_meta = "_sqfox_meta" in tables
     has_docs = "documents" in tables
-    has_vec = "documents_vec" in tables
     has_fts = "documents_fts" in tables
     has_triggers = (
         "sqfox_fts_insert" in triggers
@@ -50,11 +49,20 @@ def detect_state(conn: sqlite3.Connection) -> SchemaState:
         and "sqfox_fts_update" in triggers
     )
 
-    if has_vec and has_fts and has_triggers:
+    # Check for vec_dimension in meta (new) or legacy documents_vec table
+    has_vec_dim = False
+    if has_meta:
+        row = conn.execute(
+            "SELECT 1 FROM _sqfox_meta WHERE key = 'vec_dimension'"
+        ).fetchone()
+        has_vec_dim = row is not None
+    has_legacy_vec = "documents_vec" in tables
+
+    if has_fts and has_triggers:
         return SchemaState.ENRICHED
     if has_fts:
         return SchemaState.SEARCHABLE
-    if has_vec:
+    if has_vec_dim or has_legacy_vec:
         return SchemaState.INDEXED
     if has_meta and has_docs:
         return SchemaState.BASE
@@ -77,12 +85,11 @@ def migrate_to(
     Returns the achieved state.
 
     Note:
-        INDEXED (vec0) and SEARCHABLE (FTS5) are independent capabilities.
-        The numeric ordering in SchemaState is a convenience, not a strict
-        dependency chain.  This function checks for the *existence* of
-        individual tables rather than relying solely on numeric comparison,
-        so that e.g. requesting INDEXED when FTS5 already exists (state ==
-        SEARCHABLE) still creates the vec0 table correctly.
+        INDEXED (vector dimension) and SEARCHABLE (FTS5) are independent
+        capabilities.  The numeric ordering in SchemaState is a convenience,
+        not a strict dependency chain.  This function checks for the
+        *existence* of individual tables rather than relying solely on
+        numeric comparison.
 
     Raises:
         SchemaError: If migration fails or target requires vec_dimension
@@ -91,7 +98,7 @@ def migrate_to(
     # Inspect actual table/trigger existence.  We do NOT rely on numeric
     # SchemaState comparison for the early-return because INDEXED and
     # SEARCHABLE are orthogonal capabilities:
-    #   SEARCHABLE(3) > INDEXED(2), but that doesn't mean vec0 exists.
+    #   SEARCHABLE(3) > INDEXED(2), but that doesn't mean vec_dimension is set.
     tables = {
         row[0]
         for row in conn.execute(
@@ -106,7 +113,6 @@ def migrate_to(
     }
 
     has_base = "_sqfox_meta" in tables and "documents" in tables
-    has_vec = "documents_vec" in tables
     has_fts = "documents_fts" in tables
     has_triggers = (
         "sqfox_fts_insert" in triggers
@@ -114,11 +120,20 @@ def migrate_to(
         and "sqfox_fts_update" in triggers
     )
 
+    # Check for vec_dimension in meta (new) or legacy documents_vec table
+    has_vec_dim = False
+    if has_base:
+        row = conn.execute(
+            "SELECT 1 FROM _sqfox_meta WHERE key = 'vec_dimension'"
+        ).fetchone()
+        has_vec_dim = row is not None
+    has_vec = has_vec_dim or "documents_vec" in tables
+
     # --- BASE: core tables ---
     if not has_base and target >= SchemaState.BASE:
         _migrate_to_base(conn)
 
-    # --- INDEXED: vec0 table ---
+    # --- INDEXED: vector dimension in meta ---
     needs_vec = target in (SchemaState.INDEXED, SchemaState.ENRICHED)
 
     if not has_vec and vec_dimension is not None:
@@ -132,11 +147,17 @@ def migrate_to(
     if target >= SchemaState.SEARCHABLE and not has_fts:
         _migrate_to_searchable(conn)
 
-    # --- ENRICHED: sync triggers (requires both vec0 and FTS5) ---
+    # --- ENRICHED: sync triggers (requires FTS5) ---
     if target >= SchemaState.ENRICHED and not has_triggers:
         _migrate_to_enriched(conn)
 
-    return detect_state(conn)
+    achieved = detect_state(conn)
+    if achieved < target:
+        raise SchemaError(
+            f"Migration incomplete: requested {target.name} "
+            f"but achieved {achieved.name}"
+        )
+    return achieved
 
 
 # ---------------------------------------------------------------------------
@@ -181,22 +202,18 @@ def _migrate_to_base(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_to_indexed(conn: sqlite3.Connection, vec_dimension: int) -> None:
-    """Create vec0 virtual table and store dimension in meta."""
+    """Store vector dimension in meta."""
     if not isinstance(vec_dimension, int) or vec_dimension <= 0:
         raise SchemaError(
             f"vec_dimension must be a positive integer, got {vec_dimension!r}"
         )
-    conn.execute(
-        f"CREATE VIRTUAL TABLE IF NOT EXISTS documents_vec "
-        f"USING vec0(embedding float[{vec_dimension}])"
-    )
     conn.execute(
         "INSERT OR REPLACE INTO _sqfox_meta (key, value) VALUES (?, ?)",
         ("vec_dimension", json.dumps(vec_dimension)),
     )
     conn.commit()
     logger.info(
-        "Migrated to INDEXED: created documents_vec with dimension=%d",
+        "Migrated to INDEXED: stored vec_dimension=%d",
         vec_dimension,
     )
 
@@ -385,18 +402,18 @@ def backfill_vectors(
             dimension_validated = True
 
         conn.execute("BEGIN")
-        for row, embedding in zip(rows, embeddings):
-            vec_blob = struct.pack(f"{len(embedding)}f", *embedding)
-            conn.execute(
-                "INSERT OR REPLACE INTO documents_vec(rowid, embedding) "
-                "VALUES (?, ?)",
-                (row[0], vec_blob),
-            )
-            conn.execute(
-                "UPDATE documents SET vec_indexed = 1 WHERE id = ?",
-                (row[0],),
-            )
-        conn.commit()
+        try:
+            for row, embedding in zip(rows, embeddings):
+                vec_blob = struct.pack(f"{len(embedding)}f", *embedding)
+                conn.execute(
+                    "UPDATE documents SET embedding = ?, vec_indexed = 1 "
+                    "WHERE id = ?",
+                    (vec_blob, row[0]),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         processed += len(rows)
 
     return processed
@@ -416,6 +433,11 @@ def backfill_fts(
     Returns the number of documents processed.
     """
     state = detect_state(conn)
+    if state < SchemaState.SEARCHABLE:
+        raise SchemaError(
+            "backfill_fts requires at least SEARCHABLE state "
+            "(documents_fts table must exist)"
+        )
     has_triggers = state >= SchemaState.ENRICHED
     processed = 0
 
@@ -440,10 +462,21 @@ def backfill_fts(
                     )
                     continue
                 lemmatized = lemmatize_fn(row[1])
+                if lemmatized is None:
+                    # lemmatize_fn returned None — mark indexed to avoid
+                    # re-processing (prevents infinite loop).
+                    conn.execute(
+                        "UPDATE documents SET fts_indexed = 1 WHERE id = ?",
+                        (row[0],),
+                    )
+                    continue
                 conn.execute(
                     "UPDATE documents SET content_lemmatized = ? WHERE id = ?",
                     (lemmatized, row[0]),
                 )
+                # When has_triggers=True, the sqfox_fts_update trigger fires
+                # on UPDATE OF content_lemmatized and sets fts_indexed=1
+                # automatically.  No manual update needed.
 
                 if not has_triggers:
                     # Manually insert into FTS

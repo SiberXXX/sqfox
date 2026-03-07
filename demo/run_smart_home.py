@@ -16,6 +16,7 @@ Usage:
   python demo/run_smart_home.py
 """
 
+import argparse
 import asyncio
 import json
 import os
@@ -375,7 +376,7 @@ def extract_actions(text: str) -> list[str]:
 # Main demo
 # ---------------------------------------------------------------------------
 
-async def run():
+async def run(backend=None):
     demo_dir = Path(__file__).parent / "data"
     demo_dir.mkdir(exist_ok=True)
 
@@ -393,7 +394,7 @@ async def run():
     home = HomeState()
 
     async with (
-        AsyncSQFox(prefs_path, max_cpu_workers=1) as prefs_db,
+        AsyncSQFox(prefs_path, max_cpu_workers=1, vector_backend=backend) as prefs_db,
         AsyncSQFox(log_path) as log_db,
     ):
         # --- Load preferences ---
@@ -577,12 +578,20 @@ async def run():
 
 
 def main():
+    parser = argparse.ArgumentParser(description="sqfox Smart Home demo")
+    parser.add_argument(
+        "--backend", default=None,
+        help="Vector backend: flat, hnsw, usearch",
+    )
+    args = parser.parse_args()
+
+    backend_label = f"backend: {args.backend}" if args.backend else "backend: default"
     console.print()
     console.print(Panel(
         Align.center(
             "[bold white]sqfox demo: Smart Home[/]\n"
             "[dim]Preference-aware automation with auto-RAG[/]\n"
-            "[dim]Qwen3-Embedding-0.6B, 256 dim (MRL)[/]"
+            f"[dim]Qwen3-Embedding-0.6B, 256 dim (MRL), {backend_label}[/]"
         ),
         border_style="bold magenta",
         box=box.DOUBLE,
@@ -590,7 +599,7 @@ def main():
 
     console.print()
     get_model()
-    asyncio.run(run())
+    asyncio.run(run(backend=args.backend))
 
     console.print()
     console.print(Panel(

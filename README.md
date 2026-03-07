@@ -16,7 +16,7 @@ No server. No Docker. No network. One `.db` file. Runs on anything — Raspberry
 ## Install
 
 ```bash
-# Core only (zero dependencies, includes SqliteHnswBackend)
+# Core only (zero dependencies, includes SqliteHnswBackend + SqliteFlatBackend)
 pip install sqfox
 
 # With hybrid search (English)
@@ -90,16 +90,19 @@ sqfox detects `embed_documents` / `embed_query` methods and calls the right one 
 
 ### Pluggable Vector Backends
 
-By default, sqfox uses sqlite-vec (brute-force KNN). For larger datasets, plug in the built-in HNSW backend — pure Python, zero C dependencies, O(log N) search:
+sqfox ships with two pure-Python vector backends — zero C dependencies:
+
+- **HNSW** (auto-selected for most environments) — O(log N) approximate nearest-neighbor search, graph stored as BLOB in SQLite.
+- **Flat** — brute-force KNN, simple and exact.
 
 ```python
 from sqfox import SQFox, SqliteHnswBackend
 
-# Default — sqlite-vec (brute-force, good up to ~50K vectors)
+# Auto-selected for desktop/server — HNSW (O(log N), pure Python, graph stored in SQLite as BLOB)
 db = SQFox("app.db")
 
-# HNSW — O(log N), pure Python, graph stored in SQLite as BLOB
-db = SQFox("app.db", vector_backend="hnsw")
+# Flat — brute-force KNN, exact search
+db = SQFox("app.db", vector_backend="flat")
 
 # HNSW with custom parameters
 backend = SqliteHnswBackend(M=16, ef_construction=200, ef_search=64)
@@ -114,10 +117,11 @@ The HNSW graph is stored alongside documents in the same `.db` file. SQLite is t
 from sqfox import VectorBackend
 
 class MyBackend:
+    def set_writer_conn(self, conn) -> None: ...
     def initialize(self, db_path: str, ndim: int) -> None: ...
     def add(self, keys: list[int], vectors: list[list[float]]) -> None: ...
     def remove(self, keys: list[int]) -> None: ...
-    def search(self, query: list[float], k: int) -> list[tuple[int, float]]: ...
+    def search(self, query: list[float], k: int, **kwargs) -> list[tuple[int, float]]: ...
     def flush(self) -> None: ...
     def count(self) -> int: ...
     def close(self) -> None: ...
@@ -201,6 +205,17 @@ with SQFox("app.db") as db:
     db.backup("backup.db", progress=progress)
 ```
 
+### Vacuum
+
+```python
+with SQFox("app.db") as db:
+    # Rewrite DB file, reclaim space from deleted rows
+    db.vacuum()
+
+    # Or write a compacted copy (no 2x disk space needed)
+    db.vacuum(into="compacted.db")
+```
+
 ### Async (FastAPI / asyncio)
 
 `AsyncSQFox` — async facade with dual thread pools. I/O reads are never blocked by CPU-heavy embedding/reranking:
@@ -265,16 +280,17 @@ Writer Thread (single)          Reader Threads (many)
                      |
           +----------+----------+
           |                     |
-     sqlite-vec            HNSW graph
+      Flat backend         HNSW graph
      (brute KNN)         (BLOB in SQLite)
 ```
 
 - **Writes**: All writes go through a `PriorityQueue` to a single writer thread. Batched into one transaction (`BEGIN IMMEDIATE`). No `database is locked` errors.
 - **Reads**: Each thread gets its own connection via `threading.local()`. Parallel, non-blocking (WAL mode).
-- **Search**: FTS5 (BM25) and vector backend (sqlite-vec or HNSW) run independently. Merged via Relative Score Fusion with adaptive alpha.
-- **Vector backends**: `sqlite-vec` (brute-force, default) or `SqliteHnswBackend` (pure Python HNSW, O(log N), graph serialized as CSR BLOB in SQLite). Custom backends via the `VectorBackend` protocol.
+- **Search**: FTS5 (BM25) and vector backend (HNSW or Flat) run independently. Merged via Relative Score Fusion with adaptive alpha.
+- **Vector backends**: `SqliteHnswBackend` (default, pure Python HNSW, O(log N), graph serialized as CSR BLOB in SQLite) or `SqliteFlatBackend` (brute-force KNN). Custom backends via the `VectorBackend` protocol. Pure Python, zero C dependencies.
 - **Crash safety**: Embedding BLOBs are always stored in SQLite (source of truth). The HNSW graph is a rebuildable cache — if corrupted, it auto-recovers from BLOBs on startup.
-- **Auto-PRAGMA**: WAL, `synchronous=NORMAL`, `busy_timeout=5000`, `temp_store=MEMORY`, `cache_size=-64000` (64 MB), `mmap_size=256MB`, `foreign_keys=ON`.
+- **Auto-adaptive**: Detects RAM, CPU count, platform (Desktop / Raspberry Pi / Android Termux / SBC), SD card. Tunes PRAGMAs automatically: LOW (<1 GB) → 4 MB cache, no mmap; MEDIUM (1–4 GB) → 16 MB cache, 64 MB mmap; HIGH (>4 GB) → 64 MB cache, 256 MB mmap. Vector backend auto-selected on first `ingest()`. Incremental vacuum runs silently in the background. Zero config needed.
+- **Auto-PRAGMA**: WAL, `synchronous=NORMAL`, `busy_timeout=5000`, `temp_store=MEMORY`, cache/mmap auto-tuned to RAM, `foreign_keys=ON`.
 - **Schema**: Evolves automatically — `EMPTY → BASE → INDEXED → SEARCHABLE → ENRICHED`. No manual migrations. Idempotent. Resumable backfill.
 - **Lemmatization**: Mixed RU+EN text handled per-word — pymorphy3 for Cyrillic, simplemma for Latin.
 
@@ -303,7 +319,6 @@ sqfox is **not a replacement for PostgreSQL**. It is designed for a specific nic
 
 ### Known limitations
 
-- **sqlite-vec is pre-v1** — known memory leaks and segfaults on invalid input. Test on your data before production.
 - **SqliteHnswBackend** — pure Python HNSW. Faster than brute-force on 10K+ vectors, but slower than C/Rust implementations (usearch, hnswlib). Acceptable for edge/embedded scenarios.
 - **Lemmatization without context** — pymorphy3 picks the most frequent word form (~79% accuracy). Fine for search, not perfect.
 - **`synchronous=NORMAL`** — last few seconds of commits may be lost on power failure. DB file won't corrupt. Use `synchronous=FULL` manually if you need guaranteed durability.
@@ -311,7 +326,7 @@ sqfox is **not a replacement for PostgreSQL**. It is designed for a specific nic
 
 ### Sweet spot
 
-Single process, multiple threads. Up to ~50K docs with sqlite-vec, ~100K+ with HNSW backend, or ~1M rows without vectors. Local/embedded deployment. Runs fine on dual-core Celerons, old Core 2 Duo laptops, Raspberry Pi — anything with Python 3.10+. Perfect for DIY home automation, boiler controllers, sensor logging, local knowledge bases. If you're thinking "maybe I need PostgreSQL" — you probably do. sqfox is for cases where PostgreSQL is overkill or impossible.
+Single process, multiple threads. Up to ~100K+ docs with HNSW backend, or ~1M rows without vectors. Local/embedded deployment. Runs fine on dual-core Celerons, old Core 2 Duo laptops, Raspberry Pi — anything with Python 3.10+. Perfect for DIY home automation, boiler controllers, sensor logging, local knowledge bases. If you're thinking "maybe I need PostgreSQL" — you probably do. sqfox is for cases where PostgreSQL is overkill or impossible.
 
 ## Diagnostics
 
@@ -322,18 +337,68 @@ with SQFox("app.db") as db:
 
 ```json
 {
-  "sqfox_version": "0.2.0",
+  "sqfox_version": "0.3.0",
   "python_version": "3.13.7",
   "platform": "Linux-6.1.0-rpi-aarch64",
   "sqlite_version": "3.50.4",
   "path": "app.db",
   "is_running": true,
-  "vec_available": true,
   "vector_backend": "hnsw",
   "queue_size": 0,
-  "schema_state": "ENRICHED"
+  "schema_state": "ENRICHED",
+  "auto": {
+    "total_ram_mb": 512,
+    "memory_tier": "LOW",
+    "cpu_count": 4,
+    "platform_class": "RASPBERRY_PI",
+    "is_sd_card": false,
+    "fts5_available": true,
+    "resolved_cache_size_kb": 4000,
+    "resolved_mmap_size_mb": 0
+  }
 }
 ```
+
+## Auto-Adaptive Tuning (0.3.0+)
+
+sqfox **auto-detects** your environment at startup and configures itself:
+
+| Detected | How | Fallback |
+|---|---|---|
+| RAM | `/proc/meminfo`, `sysctl`, `GlobalMemoryStatusEx` | 1 GB |
+| CPU count | `sched_getaffinity` (Docker-aware), `cpu_count()` | 1 |
+| Platform | `TERMUX_VERSION` env, `/proc/device-tree/model`, arch | Desktop |
+| SD card | Path heuristic (`/media/`, `/mnt/sd`, etc.) | No |
+| FTS5 | Probe in `:memory:` | Vector-only search |
+
+PRAGMA tuning by memory tier:
+
+| Tier | RAM | cache_size | mmap_size |
+|---|---|---|---|
+| LOW | < 1 GB | 4 MB | 0 (disabled) |
+| MEDIUM | 1–4 GB | 16 MB | 64 MB |
+| HIGH | > 4 GB | 64 MB | 256 MB |
+
+**Zero config needed.** Just `SQFox("data.db")` — it works on a Raspberry Pi, an Android phone, or a 64 GB desktop.
+
+To override auto-detection, pass explicit values:
+
+```python
+# Force specific settings (disables auto for these params)
+db = SQFox(
+    "sensors.db",
+    cache_size_kb=8_000,    # override auto: 8 MB
+    mmap_size_mb=0,         # override auto: disable mmap
+)
+```
+
+Additional tips:
+
+- **SD card durability**: Default `synchronous=NORMAL` may lose the last transaction on power loss (file won't corrupt). For hard guarantees, run `db.write("PRAGMA synchronous=FULL", wait=True)` after start.
+- **Disk space**: sqfox enables incremental auto-vacuum on new databases and reclaims pages silently during ingestion. For manual compaction: `db.vacuum()` or `db.vacuum(into="compacted.db")`.
+- **Android / Termux**: FTS5 support depends on the Python build. Most Kivy, BeeWare, and Termux Python packages include FTS5. If FTS5 is unavailable, sqfox detects this and works with vector-only search — no crash, no config needed.
+- **Graceful shutdown**: sqfox registers an `atexit` hook so the writer thread is drained on normal process exit. For `SIGKILL` or hard power-off, SQLite WAL journaling protects the database file.
+- **FTS5 self-healing**: On every startup, sqfox runs an FTS integrity check. If the index is corrupt, it auto-rebuilds.
 
 ## Platform Support
 
@@ -343,10 +408,10 @@ with SQFox("app.db") as db:
 | Linux ARM64 (Raspberry Pi, industrial PCs) | works |
 | macOS Intel / Apple Silicon | works |
 | Windows x86-64 | works |
-| Alpine Linux (musl) | **no** — no musllinux wheel, use `python:3.x-slim` |
-| 32-bit / Windows ARM64 | **no** |
+| Alpine Linux (musl) | works |
+| 32-bit / Windows ARM64 | works (pure Python, no C extensions) |
 
-If sqlite-vec is unavailable, sqfox falls back to FTS-only search (or use `SqliteHnswBackend` which has no C dependencies).
+All vector backends are pure Python with zero C dependencies, so sqfox runs on any platform with Python 3.10+.
 
 ## Demos
 
@@ -371,9 +436,10 @@ python demo/run_smart_mechanic.py
 
 - Python >= 3.10
 - Core: zero dependencies (stdlib only)
-- `[search]`: simplemma, sqlite-vec
+- `[search]`: simplemma
 - `[search-ru]`: + pymorphy3
-- `SqliteHnswBackend`: included in core (pure Python, no extra deps)
+- `[search-hnsw]`: usearch, numpy (optional USearch backend)
+- SqliteHnswBackend + SqliteFlatBackend: included in core (pure Python, no extra deps)
 
 ## License
 

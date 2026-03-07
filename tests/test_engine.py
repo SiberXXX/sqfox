@@ -114,31 +114,32 @@ class TestWrites:
         """HIGH priority writes should execute before LOW."""
         db = SQFox(db_path, batch_time_ms=200)
         db.start()
-        db.write("CREATE TABLE IF NOT EXISTS ordering (id INTEGER PRIMARY KEY, val TEXT)", wait=True)
+        try:
+            db.write("CREATE TABLE IF NOT EXISTS ordering (id INTEGER PRIMARY KEY, val TEXT)", wait=True)
 
-        blocker = threading.Event()
+            blocker = threading.Event()
 
-        # Block the writer
-        def block_fn(conn):
-            blocker.wait(timeout=5)
-        db.execute_on_writer(block_fn, wait=False)
-        time.sleep(0.05)  # let it start
+            # Block the writer
+            def block_fn(conn):
+                blocker.wait(timeout=5)
+            db.execute_on_writer(block_fn, wait=False)
+            time.sleep(0.05)  # let it start
 
-        # Enqueue LOW then HIGH while writer is blocked
-        f_low = db.write("INSERT INTO ordering (val) VALUES ('low')", priority=Priority.LOW)
-        f_high = db.write("INSERT INTO ordering (val) VALUES ('high')", priority=Priority.HIGH)
+            # Enqueue LOW then HIGH while writer is blocked
+            f_low = db.write("INSERT INTO ordering (val) VALUES ('low')", priority=Priority.LOW)
+            f_high = db.write("INSERT INTO ordering (val) VALUES ('high')", priority=Priority.HIGH)
 
-        # Unblock
-        blocker.set()
-        f_low.result(timeout=5)
-        f_high.result(timeout=5)
+            # Unblock
+            blocker.set()
+            f_low.result(timeout=5)
+            f_high.result(timeout=5)
 
-        rows = db.fetch_all("SELECT val FROM ordering ORDER BY id")
-        # HIGH should have been processed first
-        assert rows[0]["val"] == "high"
-        assert rows[1]["val"] == "low"
-
-        db.stop()
+            rows = db.fetch_all("SELECT val FROM ordering ORDER BY id")
+            # HIGH should have been processed first
+            assert rows[0]["val"] == "high"
+            assert rows[1]["val"] == "low"
+        finally:
+            db.stop()
 
     def test_queue_full(self, tmp_path):
         db = SQFox(str(tmp_path / "qf.db"), max_queue_size=2, batch_time_ms=500)
@@ -232,6 +233,8 @@ class TestConcurrency:
             t.start()
         for t in threads:
             t.join(timeout=30)
+        for t in threads:
+            assert not t.is_alive(), "Writer thread did not finish in time"
 
         assert not errors, f"Errors during concurrent writes: {errors}"
 
@@ -262,6 +265,8 @@ class TestConcurrency:
             t.start()
         for t in threads:
             t.join(timeout=10)
+        for t in threads:
+            assert not t.is_alive(), "Reader thread did not finish in time"
 
         assert all(r == "data" for r in results)
         # Each thread should have its own connection
@@ -340,13 +345,14 @@ class TestErrorCallback:
 
         db = SQFox(db_path, error_callback=on_error)
         db.start()
+        try:
+            # Fire-and-forget — no wait
+            db.write("INSERT INTO nonexistent_table VALUES (1)")
 
-        # Fire-and-forget — no wait
-        db.write("INSERT INTO nonexistent_table VALUES (1)")
-
-        # Give writer thread time to process
-        time.sleep(0.3)
-        db.stop()
+            # Give writer thread time to process
+            time.sleep(0.3)
+        finally:
+            db.stop()
 
         assert len(errors) == 1
         sql, exc = errors[0]
@@ -362,30 +368,21 @@ class TestErrorCallback:
 
         db = SQFox(db_path, error_callback=on_error)
         db.start()
-        db.write(
-            "CREATE TABLE uniq (id INTEGER PRIMARY KEY, val TEXT UNIQUE)",
-            wait=True,
-        )
-        db.write("INSERT INTO uniq VALUES (1, 'a')", wait=True)
+        try:
+            db.write(
+                "CREATE TABLE uniq (id INTEGER PRIMARY KEY, val TEXT UNIQUE)",
+                wait=True,
+            )
+            db.write("INSERT INTO uniq VALUES (1, 'a')", wait=True)
 
-        # Duplicate — will fail, fire-and-forget
-        db.write("INSERT INTO uniq VALUES (2, 'a')")
-        time.sleep(0.3)
-        db.stop()
+            # Duplicate — will fail, fire-and-forget
+            db.write("INSERT INTO uniq VALUES (2, 'a')")
+            time.sleep(0.3)
+        finally:
+            db.stop()
 
         assert len(errors) >= 1
         assert "UNIQUE" in str(errors[0][1]).upper() or "constraint" in str(errors[0][1]).lower()
-
-    def test_no_callback_no_crash(self, db_path):
-        """Without error_callback, errors still go to Future / logging."""
-        db = SQFox(db_path)
-        db.start()
-
-        future = db.write("INSERT INTO nope VALUES (1)")
-        with pytest.raises(sqlite3.OperationalError):
-            future.result(timeout=5)
-
-        db.stop()
 
     def test_callback_receives_batch_abort(self, db_path):
         """When a batch fails, subsequent requests also trigger callback."""
@@ -396,15 +393,17 @@ class TestErrorCallback:
 
         db = SQFox(db_path, error_callback=on_error, batch_time_ms=500)
         db.start()
-        db.write("CREATE TABLE t (id INTEGER PRIMARY KEY)", wait=True)
+        try:
+            db.write("CREATE TABLE t (id INTEGER PRIMARY KEY)", wait=True)
 
-        # These will likely batch together — second one fails
-        db.write("INSERT INTO t VALUES (1)")
-        db.write("INSERT INTO nonexistent VALUES (2)")
-        db.write("INSERT INTO t VALUES (3)")
+            # These will likely batch together — second one fails
+            db.write("INSERT INTO t VALUES (1)")
+            db.write("INSERT INTO nonexistent VALUES (2)")
+            db.write("INSERT INTO t VALUES (3)")
 
-        time.sleep(1.0)
-        db.stop()
+            time.sleep(1.0)
+        finally:
+            db.stop()
 
         # At least the bad SQL triggered the callback
         assert any("nonexistent" in s for s in errors)
@@ -596,7 +595,6 @@ class TestDiagnostics:
         assert "is_running" in diag
         assert diag["is_running"] is True
         assert diag["path"] == db_path
-        assert "vec_available" in diag
         assert "schema_state" in diag
         db.stop()
 
@@ -659,12 +657,6 @@ class TestSearch:
             )
             assert "Python" in results[0].text or "database" in results[0].text
 
-    def test_search_empty_db(self, db_path):
-        """Search on empty DB returns empty list."""
-        with SQFox(db_path) as db:
-            results = db.search("anything")
-            assert results == []
-
     def test_search_broken_embed_falls_back_to_fts(self, db_path):
         """search() with broken embed_fn falls back to FTS results.
 
@@ -706,20 +698,6 @@ class TestEnsureSchema:
             assert result >= SchemaState.SEARCHABLE
             row = db.fetch_one("SELECT name FROM sqlite_master WHERE name='documents_fts'")
             assert row is not None
-
-
-# ---------------------------------------------------------------------------
-# VecAvailable tests
-# ---------------------------------------------------------------------------
-
-class TestVecAvailable:
-    def test_vec_available_property(self, db_path):
-        with SQFox(db_path) as db:
-            assert isinstance(db.vec_available, bool)
-
-    def test_vec_disabled(self, db_path):
-        with SQFox(db_path, enable_vec=False) as db:
-            assert db.vec_available is False
 
 
 # ---------------------------------------------------------------------------

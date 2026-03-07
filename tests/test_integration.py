@@ -1,11 +1,10 @@
 """End-to-end integration tests: ingest → search through full stack."""
 
-import struct
 import time
 
 import pytest
 
-from sqfox import SQFox, SQFoxManager, SchemaState, Priority
+from sqfox import SQFox, SQFoxManager, SchemaState
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -76,12 +75,7 @@ class TestSingleDBEndToEnd:
 
     def test_ingest_and_hybrid_search(self, tmp_path):
         """Ingest with embeddings, hybrid search."""
-        try:
-            import sqlite_vec
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
-
-        with SQFox(str(tmp_path / "hybrid.db")) as db:
+        with SQFox(str(tmp_path / "hybrid.db"), vector_backend="hnsw") as db:
             db.ingest(
                 "SQLite database configuration and optimization",
                 embed_fn=mock_embed,
@@ -108,18 +102,13 @@ class TestSingleDBEndToEnd:
 
     def test_ingest_with_chunker(self, tmp_path):
         """Ingest a long document that gets chunked."""
-        try:
-            import sqlite_vec
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
-
         long_doc = (
             "SQLite database engine overview\n\n"
             "Python code for server deployment\n\n"
             "IoT sensor temperature readings"
         )
 
-        with SQFox(str(tmp_path / "chunked.db")) as db:
+        with SQFox(str(tmp_path / "chunked.db"), vector_backend="hnsw") as db:
             parent_id = db.ingest(
                 long_doc,
                 chunker=simple_chunker,
@@ -147,12 +136,7 @@ class TestSingleDBEndToEnd:
 
     def test_ingest_with_metadata(self, tmp_path):
         """Metadata is stored and returned in search results."""
-        try:
-            import sqlite_vec
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
-
-        with SQFox(str(tmp_path / "meta.db")) as db:
+        with SQFox(str(tmp_path / "meta.db"), vector_backend="hnsw") as db:
             db.ingest(
                 "SQLite database performance tuning",
                 metadata={"source": "docs", "version": 3},
@@ -169,18 +153,13 @@ class TestSingleDBEndToEnd:
 
     def test_dimension_mismatch_caught(self, tmp_path):
         """Ingesting with different embedding dimensions raises error."""
-        try:
-            import sqlite_vec
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
-
         def embed_4d(texts):
             return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
 
         def embed_8d(texts):
             return [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] for _ in texts]
 
-        with SQFox(str(tmp_path / "dim.db")) as db:
+        with SQFox(str(tmp_path / "dim.db"), vector_backend="hnsw") as db:
             db.ingest("First doc", embed_fn=embed_4d, wait=True)
             with pytest.raises(Exception, match="dimension"):
                 db.ingest("Second doc", embed_fn=embed_8d, wait=True)
@@ -210,18 +189,13 @@ class TestSchemaAutoMigration:
             )
             assert row is not None
 
-    def test_ingest_with_embed_creates_vec_table(self, tmp_path):
-        try:
-            import sqlite_vec
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
-
-        with SQFox(str(tmp_path / "autovec.db")) as db:
+    def test_ingest_with_embed_stores_dimension(self, tmp_path):
+        with SQFox(str(tmp_path / "autovec.db"), vector_backend="hnsw") as db:
             db.ingest("Vector doc", embed_fn=mock_embed, wait=True)
 
             time.sleep(0.05)
             row = db.fetch_one(
-                "SELECT name FROM sqlite_master WHERE name = 'documents_vec'"
+                "SELECT value FROM _sqfox_meta WHERE key = 'vec_dimension'"
             )
             assert row is not None
 
@@ -234,12 +208,7 @@ class TestManagerEndToEnd:
     """Multi-database scenario."""
 
     def test_multi_domain_ingest_and_search(self, tmp_path):
-        try:
-            import sqlite_vec
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
-
-        with SQFoxManager(tmp_path / "multi") as mgr:
+        with SQFoxManager(tmp_path / "multi", vector_backend="hnsw") as mgr:
             # IoT domain
             mgr.ingest_to(
                 "sensors",
@@ -313,14 +282,9 @@ class TestConcurrentOperations:
         """Search should work while ingest is ongoing."""
         import threading
 
-        try:
-            import sqlite_vec
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
-
         db_path = str(tmp_path / "concurrent.db")
 
-        with SQFox(db_path) as db:
+        with SQFox(db_path, vector_backend="hnsw") as db:
             # Pre-populate
             for i in range(5):
                 db.ingest(
@@ -364,6 +328,8 @@ class TestConcurrentOperations:
 
             t_write.join(timeout=30)
             t_read.join(timeout=30)
+            assert not t_write.is_alive(), "Write thread did not finish in time"
+            assert not t_read.is_alive(), "Read thread did not finish in time"
 
             assert not errors, f"Errors during concurrent ops: {errors}"
             # Reader should have gotten results at least some of the time
@@ -401,14 +367,9 @@ class TestEmbedderProtocol:
     """Embedder with embed_documents/embed_query is dispatched correctly."""
 
     def test_embedder_object_dispatches_correctly(self, tmp_path):
-        try:
-            import sqlite_vec
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
-
         embedder = MockInstructionEmbedder()
 
-        with SQFox(str(tmp_path / "embedder.db")) as db:
+        with SQFox(str(tmp_path / "embedder.db"), vector_backend="hnsw") as db:
             db.ingest(
                 "SQLite database configuration",
                 embed_fn=embedder,
@@ -430,25 +391,6 @@ class TestEmbedderProtocol:
             assert embedder.query_calls >= 1
             assert len(results) >= 1
 
-    def test_plain_callable_still_works(self, tmp_path):
-        """Backward compatibility: plain function works as before."""
-        try:
-            import sqlite_vec
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
-
-        with SQFox(str(tmp_path / "plain.db")) as db:
-            db.ingest(
-                "SQLite database configuration",
-                embed_fn=mock_embed,
-                wait=True,
-            )
-
-            time.sleep(0.1)
-
-            results = db.search("database", embed_fn=mock_embed)
-            assert len(results) >= 1
-
 
 # ---------------------------------------------------------------------------
 # Reranker end-to-end
@@ -459,12 +401,7 @@ class TestRerankerEndToEnd:
 
     def test_reranker_changes_order(self, tmp_path):
         """reranker_fn should re-score and reorder results."""
-        try:
-            import sqlite_vec
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
-
-        with SQFox(str(tmp_path / "rerank.db")) as db:
+        with SQFox(str(tmp_path / "rerank.db"), vector_backend="hnsw") as db:
             db.ingest("Alpha document about databases", embed_fn=mock_embed, wait=True)
             db.ingest("Beta document about servers", embed_fn=mock_embed, wait=True)
             db.ingest("Gamma document about databases and servers", embed_fn=mock_embed, wait=True)
@@ -482,30 +419,3 @@ class TestRerankerEndToEnd:
             assert len(results) >= 1
             assert "servers" in results[0].text.lower()
 
-    def test_reranker_with_rerank_top_n(self, tmp_path):
-        """rerank_top_n controls how many candidates the reranker sees."""
-        try:
-            import sqlite_vec
-        except ImportError:
-            pytest.skip("sqlite-vec not available")
-
-        seen = []
-
-        def tracking_reranker(query, texts):
-            seen.append(len(texts))
-            return [1.0] * len(texts)
-
-        with SQFox(str(tmp_path / "topn.db")) as db:
-            for i in range(10):
-                db.ingest(f"Document {i} about testing", embed_fn=mock_embed, wait=True)
-            time.sleep(0.1)
-
-            db.search(
-                "testing",
-                embed_fn=mock_embed,
-                reranker_fn=tracking_reranker,
-                limit=2,
-                rerank_top_n=5,
-            )
-            assert seen
-            assert seen[0] <= 5

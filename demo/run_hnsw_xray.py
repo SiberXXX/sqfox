@@ -16,8 +16,6 @@ Usage:
   python demo/run_hnsw_xray.py
 """
 
-import array as _array
-import math
 import os
 import sys
 import time
@@ -150,142 +148,18 @@ KNOWLEDGE_BASE = [
 
 
 # ---------------------------------------------------------------------------
-# X-Ray: graph analysis helpers
-# ---------------------------------------------------------------------------
-
-def xray_graph(backend: SqliteHnswBackend, ndim: int) -> dict:
-    """Extract detailed stats from the HNSW graph internals."""
-    info = {
-        "entry_point": backend._entry_point,
-        "max_level": backend._max_level,
-        "total_nodes": backend._count,
-        "ndim": ndim,
-        "M": backend._M,
-        "M0": backend._M0,
-        "ef_construction": backend._ef_construction,
-        "ef_search": backend._ef_search,
-        "levels": [],
-    }
-
-    for lv in range(len(backend._graphs)):
-        g = backend._graphs[lv]
-        g.merge()
-        node_ids = sorted(g.all_node_ids() - backend._deleted)
-        if not node_ids:
-            info["levels"].append({
-                "level": lv, "nodes": 0, "edges": 0,
-                "avg_degree": 0, "min_degree": 0, "max_degree": 0,
-                "orphans": 0,
-            })
-            continue
-
-        degrees = []
-        total_edges = 0
-        orphans = 0
-        for nid in node_ids:
-            nbrs = [n for n in g.neighbors(nid) if n not in backend._deleted]
-            degrees.append(len(nbrs))
-            total_edges += len(nbrs)
-            if not nbrs:
-                orphans += 1
-
-        info["levels"].append({
-            "level": lv,
-            "nodes": len(node_ids),
-            "edges": total_edges,
-            "avg_degree": sum(degrees) / len(degrees) if degrees else 0,
-            "min_degree": min(degrees) if degrees else 0,
-            "max_degree": max(degrees) if degrees else 0,
-            "orphans": orphans,
-        })
-
-    return info
-
-
-def trace_search_path(backend, query_vec, conn):
-    """Trace the greedy search path through HNSW layers."""
-    steps = []
-    ep = backend._entry_point
-    if ep is None:
-        return steps
-
-    q = _array.array("f", query_vec)
-    current = ep
-    current_vec = backend._get_vector(current, conn)
-    if current_vec is None:
-        return steps
-    current_dist = math.dist(q, current_vec)
-
-    steps.append({
-        "level": backend._max_level,
-        "node": current,
-        "distance": current_dist,
-        "action": "entry",
-    })
-
-    for level in range(backend._max_level, 0, -1):
-        changed = True
-        while changed:
-            changed = False
-            with backend._lock:
-                nbrs = list(backend._neighbors(current, level))
-            alive = [n for n in nbrs if n not in backend._deleted]
-            vecs = backend._fetch_batch(alive, conn)
-            for n, v in vecs.items():
-                d = math.dist(q, v)
-                if d < current_dist:
-                    current_dist = d
-                    current = n
-                    changed = True
-                    steps.append({
-                        "level": level,
-                        "node": current,
-                        "distance": current_dist,
-                        "action": "jump",
-                    })
-        steps.append({
-            "level": level, "node": current,
-            "distance": current_dist, "action": "drop",
-        })
-
-    results = backend._search_layer(q, current, backend._ef_search, 0, conn)
-    if results:
-        steps.append({
-            "level": 0, "node": results[0][0],
-            "distance": results[0][1], "action": "found",
-        })
-
-    return steps
-
-
-def get_node_degree_map(backend):
-    """Return {node_id: degree_on_L0} for all nodes."""
-    if not backend._graphs:
-        return {}
-    g = backend._graphs[0]
-    g.merge()
-    result = {}
-    for nid in g.all_node_ids():
-        if nid not in backend._deleted:
-            nbrs = [n for n in g.neighbors(nid) if n not in backend._deleted]
-            result[nid] = len(nbrs)
-    return result
-
-
-# ---------------------------------------------------------------------------
 # Display functions
 # ---------------------------------------------------------------------------
 
-def show_stats(backend, ndim, db):
+def show_stats(backend, db):
     """Display full graph stats."""
-    info = xray_graph(backend, ndim)
+    info = backend.graph_stats()
 
     console.print()
 
     # Parameters
     summary = Table(show_header=False, box=None, padding=(0, 2))
-    summary.add_row("Vectors", f"[bold cyan]{info['total_nodes']}[/]")
-    summary.add_row("Dimensions", f"[cyan]{info['ndim']}[/]")
+    summary.add_row("Vectors", f"[bold cyan]{info['count']}[/]")
     summary.add_row("Max level", f"[cyan]{info['max_level']}[/]")
     summary.add_row("Entry point", f"[cyan]doc {info['entry_point']}[/]")
     summary.add_row("M", f"[dim]{info['M']}[/]")
@@ -311,7 +185,7 @@ def show_stats(backend, ndim, db):
     for lv_info in reversed(info["levels"]):
         lv = lv_info["level"]
         nodes = lv_info["nodes"]
-        total = info["total_nodes"]
+        total = info["count"]
         bar_w = 25
         filled = int(nodes / total * bar_w) if total > 0 else 0
         bar = "[green]" + "#" * filled + "[/][dim]" + "." * (bar_w - filled) + "[/]"
@@ -333,7 +207,7 @@ def show_stats(backend, ndim, db):
     tree = Tree("[bold cyan]HNSW Layers[/]")
     for lv_info in reversed(info["levels"]):
         lv = lv_info["level"]
-        total = info["total_nodes"]
+        total = info["count"]
         pct = lv_info["nodes"] / total * 100 if total > 0 else 0
         style = "bold yellow" if lv == info["max_level"] else "cyan"
         branch = tree.add(
@@ -350,7 +224,7 @@ def show_stats(backend, ndim, db):
     )
     blob_size = blob_row[0] if blob_row and blob_row[0] else 0
     total_edges = sum(lv["edges"] for lv in info["levels"])
-    total = info["total_nodes"]
+    total = info["count"]
 
     dt = Table(
         title="Density & Size", box=box.ROUNDED,
@@ -432,11 +306,12 @@ def show_search_trace(query_text, steps, results, search_ms):
 
 def show_node(node_id, backend, db):
     """Inspect a single node: text, level, neighbors."""
-    if node_id not in backend._node_levels:
+    ninfo = backend.node_info(node_id)
+    if ninfo is None:
         console.print(f"  [red]Node {node_id} not found[/]")
         return
 
-    level = backend._node_levels[node_id]
+    level = ninfo["level"]
     row = db.fetch_one(
         "SELECT content, metadata FROM documents WHERE id = ?", (node_id,)
     )
@@ -451,26 +326,21 @@ def show_node(node_id, backend, db):
     ))
 
     # Neighbors per level
-    for lv in range(level + 1):
-        if lv < len(backend._graphs):
-            g = backend._graphs[lv]
-            nbrs = [n for n in g.neighbors(node_id) if n not in backend._deleted]
-            nbr_str = ", ".join(str(n) for n in nbrs[:20])
-            if len(nbrs) > 20:
-                nbr_str += f" ... (+{len(nbrs) - 20})"
-            console.print(
-                f"  L{lv}: [cyan]{len(nbrs)}[/] neighbors  [dim]{nbr_str}[/]"
-            )
+    for lv, nbrs in sorted(ninfo["neighbors_by_level"].items()):
+        nbr_str = ", ".join(str(n) for n in nbrs[:20])
+        if len(nbrs) > 20:
+            nbr_str += f" ... (+{len(nbrs) - 20})"
+        console.print(
+            f"  L{lv}: [cyan]{len(nbrs)}[/] neighbors  [dim]{nbr_str}[/]"
+        )
 
 
 def show_top_hubs(backend, db, n=10):
     """Show top connected nodes (hubs) on layer 0."""
-    deg_map = get_node_degree_map(backend)
-    if not deg_map:
+    top = backend.top_hubs(n)
+    if not top:
         console.print("  [dim]No nodes[/]")
         return
-
-    top = sorted(deg_map.items(), key=lambda x: x[1], reverse=True)[:n]
 
     console.print()
     ht = Table(
@@ -486,7 +356,8 @@ def show_top_hubs(backend, db, n=10):
     for i, (nid, deg) in enumerate(top):
         row = db.fetch_one("SELECT content FROM documents WHERE id = ?", (nid,))
         text = row["content"][:60].replace("\n", " ") if row else "?"
-        lv = backend._node_levels.get(nid, 0)
+        ninfo = backend.node_info(nid)
+        lv = ninfo["level"] if ninfo else 0
         ht.add_row(str(i + 1), str(nid), str(deg), str(lv), f"[dim]{text}[/]")
 
     console.print(ht)
@@ -588,7 +459,7 @@ def main():
     console.print(it)
 
     # Show initial stats
-    show_stats(backend, ndim, db)
+    show_stats(backend, db)
 
     # --- Interactive REPL ---
     console.print()
@@ -615,7 +486,7 @@ def main():
                 continue
 
             if line.lower() == "/stats":
-                show_stats(backend, ndim, db)
+                show_stats(backend, db)
                 continue
 
             if line.lower() == "/top":
@@ -636,8 +507,8 @@ def main():
 
             # --- Search query ---
             query_vec = embedder.embed_query(line)
-            conn = db._get_reader_connection()
-            steps = trace_search_path(backend, query_vec, conn)
+            with db.reader() as conn:
+                steps = backend.search_trace(query_vec, conn)
 
             t0 = time.time()
             results = db.search(line, embed_fn=embedder, limit=5)

@@ -26,7 +26,8 @@ class TestMinMaxNormalize:
     def test_identical_scores(self):
         results = [(1, 5.0), (2, 5.0), (3, 5.0)]
         norm = _min_max_normalize(results)
-        assert all(v == 1.0 for v in norm.values())
+        # All-same scores → neutral 0.5 to avoid inflating importance
+        assert all(v == 0.5 for v in norm.values())
 
     def test_empty(self):
         assert _min_max_normalize([]) == {}
@@ -34,7 +35,7 @@ class TestMinMaxNormalize:
     def test_single_result(self):
         results = [(1, 42.0)]
         norm = _min_max_normalize(results)
-        assert norm[1] == 1.0
+        assert norm[1] == 0.5
 
     def test_two_results(self):
         results = [(1, 0.0), (2, 1.0)]
@@ -483,65 +484,57 @@ class TestFtsSearch:
 
 
 class TestVecSearch:
-    """Direct tests for vec_search (bypassing hybrid_search)."""
+    """Direct tests for vec_search with a Flat backend."""
 
-    def _make_vec_db(self, tmp_path):
-        import sqlite3
-        import struct
-        conn = sqlite3.connect(str(tmp_path / "vec_unit.db"))
-        conn.row_factory = sqlite3.Row
-
-        try:
-            conn.enable_load_extension(True)
-            import sqlite_vec
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-        except (ImportError, AttributeError):
-            pytest.skip("sqlite-vec not available")
-
-        from sqfox.schema import migrate_to
-        from sqfox.types import SchemaState
-        migrate_to(conn, SchemaState.INDEXED, vec_dimension=4)
-
-        # Insert test vectors
+    def _make_flat_backend(self):
+        from sqfox.backends.flat import SqliteFlatBackend
+        backend = SqliteFlatBackend()
+        backend.initialize(":memory:", 4)
         vecs = [
-            (1, [1.0, 0.0, 0.0, 0.0]),  # unit x
-            (2, [0.0, 1.0, 0.0, 0.0]),  # unit y
-            (3, [0.7, 0.7, 0.0, 0.0]),  # between x and y
+            [1.0, 0.0, 0.0, 0.0],  # unit x
+            [0.0, 1.0, 0.0, 0.0],  # unit y
+            [0.7, 0.7, 0.0, 0.0],  # between x and y
         ]
-        for doc_id, vec in vecs:
-            conn.execute(
-                "INSERT INTO documents (id, content) VALUES (?, ?)",
-                (doc_id, f"doc {doc_id}"),
-            )
-            blob = struct.pack("4f", *vec)
-            conn.execute(
-                "INSERT INTO documents_vec(rowid, embedding) VALUES (?, ?)",
-                (doc_id, blob),
-            )
-        conn.commit()
-        return conn
+        backend.add([1, 2, 3], vecs)
+        return backend
 
-    def test_vec_basic_search(self, tmp_path):
+    def test_vec_basic_search(self):
         from sqfox.search import vec_search
-        conn = self._make_vec_db(tmp_path)
-        results = vec_search(conn, [1.0, 0.0, 0.0, 0.0], limit=3)
+        import sqlite3
+        backend = self._make_flat_backend()
+        conn = sqlite3.connect(":memory:")
+        results = vec_search(conn, [1.0, 0.0, 0.0, 0.0], limit=3, vector_backend=backend)
         assert len(results) == 3
         # Closest to [1,0,0,0] should be doc 1
         assert results[0][0] == 1
         conn.close()
+        backend.close()
 
-    def test_vec_scores_positive(self, tmp_path):
+    def test_vec_scores_positive(self):
         from sqfox.search import vec_search
-        conn = self._make_vec_db(tmp_path)
-        results = vec_search(conn, [1.0, 0.0, 0.0, 0.0], limit=3)
+        import sqlite3
+        backend = self._make_flat_backend()
+        conn = sqlite3.connect(":memory:")
+        results = vec_search(conn, [1.0, 0.0, 0.0, 0.0], limit=3, vector_backend=backend)
         for _, score in results:
             assert 0 < score <= 1.0, f"Vec score should be in (0, 1], got {score}"
         conn.close()
+        backend.close()
 
-    def test_vec_limit(self, tmp_path):
+    def test_vec_limit(self):
         from sqfox.search import vec_search
-        conn = self._make_vec_db(tmp_path)
-        results = vec_search(conn, [1.0, 0.0, 0.0, 0.0], limit=1)
+        import sqlite3
+        backend = self._make_flat_backend()
+        conn = sqlite3.connect(":memory:")
+        results = vec_search(conn, [1.0, 0.0, 0.0, 0.0], limit=1, vector_backend=backend)
         assert len(results) == 1
+        conn.close()
+        backend.close()
+
+    def test_vec_no_backend_returns_empty(self):
+        from sqfox.search import vec_search
+        import sqlite3
+        conn = sqlite3.connect(":memory:")
+        results = vec_search(conn, [1.0, 0.0, 0.0, 0.0], limit=3)
+        assert results == []
         conn.close()

@@ -1,6 +1,5 @@
 """Tests for sqfox schema: state detection, migrations, dimension validation, backfill."""
 
-import json
 import sqlite3
 
 import pytest
@@ -39,17 +38,14 @@ class TestDetectState:
         migrate_to(conn, SchemaState.BASE)
         assert detect_state(conn) == SchemaState.BASE
 
-    def test_detect_indexed(self, conn):
-        try:
-            conn.enable_load_extension(True)
-            import sqlite_vec
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-        except (ImportError, AttributeError):
-            pytest.skip("sqlite-vec not available")
-
+    def test_detect_indexed_stores_dimension(self, conn):
         migrate_to(conn, SchemaState.INDEXED, vec_dimension=4)
-        assert detect_state(conn) == SchemaState.INDEXED
+        # Without vec0 table, state is BASE (dimension stored in meta only)
+        assert detect_state(conn) >= SchemaState.BASE
+        dim = conn.execute(
+            "SELECT value FROM _sqfox_meta WHERE key = 'vec_dimension'"
+        ).fetchone()
+        assert dim is not None
 
     def test_detect_searchable(self, conn):
         migrate_to(conn, SchemaState.SEARCHABLE)
@@ -58,14 +54,6 @@ class TestDetectState:
         assert state == SchemaState.SEARCHABLE
 
     def test_detect_enriched(self, conn):
-        try:
-            conn.enable_load_extension(True)
-            import sqlite_vec
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-        except (ImportError, AttributeError):
-            pytest.skip("sqlite-vec not available")
-
         migrate_to(conn, SchemaState.ENRICHED, vec_dimension=4)
         assert detect_state(conn) == SchemaState.ENRICHED
 
@@ -90,17 +78,9 @@ class TestMigrations:
         assert "documents" in tables
 
     def test_migrate_base_to_indexed(self, conn):
-        try:
-            conn.enable_load_extension(True)
-            import sqlite_vec
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-        except (ImportError, AttributeError):
-            pytest.skip("sqlite-vec not available")
-
         migrate_to(conn, SchemaState.INDEXED, vec_dimension=384)
 
-        # Check dimension stored
+        # Check dimension stored in meta
         dim = get_stored_dimension(conn)
         assert dim == 384
 
@@ -139,19 +119,11 @@ class TestMigrations:
         assert result == SchemaState.BASE
 
     def test_migrate_searchable_then_indexed(self, conn):
-        """INDEXED (vec0) can be added after SEARCHABLE (FTS5).
+        """Dimension can be stored after SEARCHABLE (FTS5).
 
         This verifies that the orthogonal capabilities don't block each
         other despite SEARCHABLE(3) > INDEXED(2) numerically.
         """
-        try:
-            conn.enable_load_extension(True)
-            import sqlite_vec
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-        except (ImportError, AttributeError):
-            pytest.skip("sqlite-vec not available")
-
         # First create SEARCHABLE (FTS5 only)
         migrate_to(conn, SchemaState.SEARCHABLE)
         tables = {
@@ -161,57 +133,34 @@ class TestMigrations:
             ).fetchall()
         }
         assert "documents_fts" in tables
-        assert "documents_vec" not in tables
 
-        # Now request INDEXED — vec0 should be created
+        # Now request INDEXED — dimension should be stored
         migrate_to(conn, SchemaState.INDEXED, vec_dimension=128)
+        dim = get_stored_dimension(conn)
+        assert dim == 128
+        # FTS still exists
         tables = {
             row[0]
             for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
             ).fetchall()
         }
-        assert "documents_vec" in tables
-        assert "documents_fts" in tables  # FTS still exists
+        assert "documents_fts" in tables
 
     def test_migrate_indexed_then_enriched(self, conn):
         """ENRICHED can be reached from INDEXED (adds FTS + triggers)."""
-        try:
-            conn.enable_load_extension(True)
-            import sqlite_vec
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-        except (ImportError, AttributeError):
-            pytest.skip("sqlite-vec not available")
-
         migrate_to(conn, SchemaState.INDEXED, vec_dimension=64)
         result = migrate_to(conn, SchemaState.ENRICHED, vec_dimension=64)
         assert result == SchemaState.ENRICHED
 
     def test_migrate_searchable_then_enriched(self, conn):
         """ENRICHED can be reached from SEARCHABLE."""
-        try:
-            conn.enable_load_extension(True)
-            import sqlite_vec
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-        except (ImportError, AttributeError):
-            pytest.skip("sqlite-vec not available")
-
         migrate_to(conn, SchemaState.SEARCHABLE)
         result = migrate_to(conn, SchemaState.ENRICHED, vec_dimension=64)
         assert result == SchemaState.ENRICHED
 
     def test_migrate_empty_to_enriched(self, conn):
         """Direct jump from EMPTY to ENRICHED."""
-        try:
-            conn.enable_load_extension(True)
-            import sqlite_vec
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-        except (ImportError, AttributeError):
-            pytest.skip("sqlite-vec not available")
-
         result = migrate_to(conn, SchemaState.ENRICHED, vec_dimension=64)
         assert result == SchemaState.ENRICHED
 
@@ -253,14 +202,6 @@ class TestDimensionValidation:
 
 class TestBackfill:
     def test_backfill_vectors(self, conn):
-        try:
-            conn.enable_load_extension(True)
-            import sqlite_vec
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-        except (ImportError, AttributeError):
-            pytest.skip("sqlite-vec not available")
-
         migrate_to(conn, SchemaState.INDEXED, vec_dimension=4)
 
         # Insert some documents
@@ -309,14 +250,6 @@ class TestBackfill:
         assert len(rows) == 3
 
     def test_backfill_resumable(self, conn):
-        try:
-            conn.enable_load_extension(True)
-            import sqlite_vec
-            sqlite_vec.load(conn)
-            conn.enable_load_extension(False)
-        except (ImportError, AttributeError):
-            pytest.skip("sqlite-vec not available")
-
         migrate_to(conn, SchemaState.INDEXED, vec_dimension=4)
 
         # Insert documents
@@ -361,12 +294,6 @@ class TestBackfill:
 
     def test_backfill_vectors_empty(self, conn):
         """backfill_vectors on empty table returns 0."""
-        try:
-            conn.enable_load_extension(True)
-            import sqlite_vec
-            sqlite_vec.load(conn)
-        except (ImportError, AttributeError):
-            pytest.skip("sqlite-vec not available")
         migrate_to(conn, SchemaState.INDEXED, vec_dimension=4)
         result = backfill_vectors(conn, lambda texts: [[0.0]*4]*len(texts))
         assert result == 0

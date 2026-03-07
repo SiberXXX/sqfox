@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+- **Auto-adaptive engine**: SQFox detects RAM, CPU, platform (Raspberry Pi, Android/Termux, desktop) and tunes SQLite PRAGMAs automatically
+- `AUTO` sentinel for `cache_size_kb`, `mmap_size_mb`, `max_cpu_workers` — lets the engine pick optimal values
+- `SqliteFlatBackend` — binary-quantized brute-force backend with optional BLAS acceleration, zero dependencies
+- Auto-selection of vector backend on first `ingest()`: flat for constrained devices (Android, < 1 GB RAM), HNSW otherwise
+- FTS5 self-healing: integrity check on start, automatic rebuild if corrupt
+- Incremental auto-vacuum for new databases
+- `PRAGMA optimize` at `stop()` after high-ingestion sessions
+- Content validation in `ingest()` — rejects empty/NUL-byte strings
+- NaN/Inf guards in reranker score processing
+- `diagnostics()` now includes `"auto"` section with detected environment info
+
+### Changed
+- `cache_size_kb` and `mmap_size_mb` default to `AUTO` instead of hardcoded values
+- `min_max_normalize` returns 0.5 (neutral) for equal scores instead of 1.0
+- SD card detection tightened: `/media/` matches only mount-root paths, not arbitrary subdirectories
+
+### Removed
+- `sqlite_vec` backend (replaced by built-in SqliteFlatBackend + SqliteHnswBackend)
+
+### Fixed
+- Double-stop race condition (`_stopped` changed from bool to `threading.Event`)
+- HNSW `flush()` dirty flag race with concurrent `add()` (generation counter)
+- HNSW `_serialize()` no longer mutates `_entry_point`/`_max_level`
+- HNSW vector cache leak on `remove()`
+- Flat backend `initialize()` race with concurrent `add()`
+- Async engine executor not reset to None after shutdown
+- Future.result() timeout to prevent infinite hang on writer thread death
+
 ## 0.2.2
 
 - Исправлена ссылка на русский README (404 на PyPI)
@@ -15,7 +46,7 @@
 - **Pluggable vector backends** — `VectorBackend` protocol, параметр `vector_backend=` в `SQFox` / `AsyncSQFox`
 - **SqliteHnswBackend** — чистый Python HNSW, O(log N), ноль C-зависимостей, граф хранится как CSR BLOB в SQLite
 - **Crash recovery** — embedding BLOBы в SQLite = source of truth; при повреждении HNSW-графа автоматическая пересборка из BLOB'ов при запуске
-- **Backend registry** — фабрика `get_backend()`, алиасы `"hnsw"`, `"sqlite-vec"`
+- **Backend registry** — фабрика `get_backend()`, алиасы `"flat"`, `"hnsw"`, `"usearch"`
 - `VectorBackendError` — новый тип ошибки
 - `vector_backend_name` property в `SQFox` / `AsyncSQFox`
 - `vector_backend` поле в `diagnostics()`
